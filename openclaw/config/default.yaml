@@ -1,0 +1,197 @@
+# ============================================================
+# OpenClaw - Default Configuration
+# ============================================================
+
+app:
+  name: "OpenClaw"
+  version: "1.0.0"
+  codename: "NexusMind"
+  language: "fr"
+  debug: false
+
+# --- Gateway Configuration ---
+gateway:
+  host: "127.0.0.1"
+  port: 18789
+  workers: 1
+  cors_origins: ["*"]
+  max_request_size_mb: 50
+  rate_limit:
+    enabled: true
+    requests_per_minute: 60
+    tokens_per_minute: 100000
+    burst_multiplier: 2.0
+  streaming:
+    enabled: true
+    chunk_size: 64
+    heartbeat_interval: 15
+  cache:
+    enabled: true
+    semantic_similarity_threshold: 0.92
+    max_entries: 1000
+    ttl_seconds: 3600
+  security:
+    api_key_required: false
+    api_keys: []
+    content_filtering: true
+    pii_detection: false
+    max_prompt_length: 32000
+  ssl:
+    enabled: false
+    cert_path: ""
+    key_path: ""
+
+# --- Agent Configuration ---
+agent:
+  default_model: "anthropic/claude-sonnet"
+  temperature: 0.7
+  max_tokens: 4096
+  system_prompt_file: "agent/prompts/system.md"
+  personality_file: "agent/prompts/personality.md"
+  tools_prompt_file: "agent/prompts/tools.md"
+  max_iterations: 25
+  delegation:
+    enabled: true
+    max_depth: 3
+    confirmation_required: false
+  context:
+    max_context_tokens: 128000
+    compression_enabled: true
+    compression_threshold: 0.75
+
+# --- LLM Providers ---
+providers:
+  anthropic:
+    enabled: true
+    api_key: ""
+    default_model: "claude-sonnet-4-20250514"
+    models:
+      - id: "claude-sonnet-4-20250514"
+        name: "Claude Sonnet 4"
+        max_tokens: 8192
+        context_window: 200000
+      - id: "claude-opus-4-20250514"
+        name: "Claude Opus 4"
+        max_tokens: 8192
+        context_window: 200000
+      - id: "claude-haiku-3-5-20241022"
+        name: "Claude Haiku 3.5"
+        max_tokens: 4096
+        context_window: 200000
+  openai:
+    enabled: false
+    api_key: ""
+    default_model: "gpt-4o"
+    base_url: ""
+    models:
+      - id: "gpt-4o"
+        name: "GPT-4o"
+        max_tokens: 4096
+        context_window: 128000
+      - id: "gpt-4o-mini"
+        name: "GPT-4o Mini"
+        max_tokens: 4096
+        context_window: 128000
+  ollama:
+    enabled: false
+    base_url: "http://localhost:11434"
+    default_model: "llama3.2"
+    models: []
+  custom:
+    enabled: false
+    base_url: ""
+    api_key: ""
+    default_model: ""
+    models: []
+
+# --- Memory Configuration (MemU-style) ---
+memory:
+  enabled: true
+  store_path: "memory/store"
+  resource_layer:
+    max_raw_size_mb: 500
+    retention_days: -1  # -1 = forever
+  item_layer:
+    auto_extract: true
+    min_significance: 0.3
+  category_layer:
+    auto_organize: true
+    max_context_items: 50
+    evolution:
+      enabled: true
+      interval_minutes: 60
+      reflection_depth: 3
+  retrieval:
+    method: "hybrid"  # hybrid, semantic, keyword
+    semantic_weight: 0.5
+    keyword_weight: 0.3
+    contextual_weight: 0.2
+    top_k: 10
+  forgetting:
+    enabled: true
+    decay_rate: 0.01
+    min_access_count: 2
+    grace_period_days: 30
+
+# --- Skills Configuration ---
+skills:
+  enabled: true
+  builtin_path: "skills/builtin"
+  custom_path: "skills/custom"
+  auto_discovery: true
+  auto_install_dependencies: true
+  skill_creation:
+    enabled: true
+    require_approval: true
+
+# --- Tools Configuration ---
+tools:
+  shell:
+    enabled: true
+    sandboxed: true
+    timeout_seconds: 120
+    allowed_commands: []  # empty = all allowed
+    blocked_commands: ["rm -rf /", "mkfs", "dd if=/dev"]
+  file_manager:
+    enabled: true
+    allowed_paths: []  # empty = all allowed
+    blocked_paths: ["/etc/shadow", "/etc/passwd"]
+    max_file_size_mb: 100
+  code_executor:
+    enabled: true
+    languages: ["python", "javascript", "bash", "ruby"]
+    timeout_seconds: 60
+    max_memory_mb: 512
+  browser:
+    enabled: false
+    headless: true
+    timeout_seconds: 30
+
+# --- UI Configuration ---
+ui:
+  terminal:
+    theme: "monokai"
+    show_thinking: true
+    show_tool_calls: true
+    prompt_style: "arrow"  # arrow, lambda, caret, custom
+    custom_prompt: ""
+    colors:
+      primary: "cyan"
+      secondary: "magenta"
+      success: "green"
+      error: "red"
+      warning: "yellow"
+      info: "blue"
+  web:
+    enabled: true
+    theme: "dark"
+    port: 18790
+    auto_open: false
+
+# --- Logging ---
+logging:
+  level: "INFO"
+  file: "logs/openclaw.log"
+  max_size_mb: 50
+  rotation: 5
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
