@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenClaw - NexusMind</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Sidebar -->
+        <aside id="sidebar">
+            <div class="sidebar-header">
+                <h1 class="logo">OpenClaw</h1>
+                <span class="version">NexusMind v1.0</span>
+            </div>
+            <nav class="sidebar-nav">
+                <button class="nav-btn active" data-view="chat">
+                    <span class="icon">&#9776;</span> Chat
+                </button>
+                <button class="nav-btn" data-view="memory">
+                    <span class="icon">&#9733;</span> Memoire
+                </button>
+                <button class="nav-btn" data-view="skills">
+                    <span class="icon">&#9881;</span> Skills
+                </button>
+                <button class="nav-btn" data-view="config">
+                    <span class="icon">&#9998;</span> Config
+                </button>
+            </nav>
+            <div class="sidebar-footer">
+                <div id="status-indicator" class="status online">
+                    <span class="dot"></span> Connecte
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main id="content">
+            <!-- Chat View -->
+            <div id="view-chat" class="view active">
+                <div id="chat-messages" class="messages-container">
+                    <div class="message system">
+                        <div class="message-content">
+                            Bienvenue sur <strong>OpenClaw</strong>. Je suis ton assistant IA autonome.
+                            Pose-moi une question ou donne-moi une tache.
+                        </div>
+                    </div>
+                </div>
+                <div id="chat-input-area">
+                    <form id="chat-form">
+                        <textarea id="chat-input" placeholder="Tape ton message..." rows="1" autofocus></textarea>
+                        <button type="submit" id="send-btn" title="Envoyer">&#10148;</button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Memory View -->
+            <div id="view-memory" class="view">
+                <h2>Memoire</h2>
+                <div id="memory-search">
+                    <input type="text" id="memory-query" placeholder="Rechercher dans la memoire...">
+                    <button id="memory-search-btn">Rechercher</button>
+                </div>
+                <div id="memory-categories"></div>
+                <div id="memory-results"></div>
+            </div>
+
+            <!-- Skills View -->
+            <div id="view-skills" class="view">
+                <h2>Skills</h2>
+                <div id="skills-list"></div>
+            </div>
+
+            <!-- Config View -->
+            <div id="view-config" class="view">
+                <h2>Configuration</h2>
+                <div id="config-editor"></div>
+            </div>
+        </main>
+    </div>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
