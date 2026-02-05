@@ -1,0 +1,61 @@
+# ============================================================
+# OpenClaw NexusMind - Compose LIGHT
+# Version allegee sans nginx/certbot (acces direct au port)
+# Ideal pour : test local, VPS derriere un proxy existant
+#
+# Usage:
+#   cp .env.example .env
+#   docker compose -f docker-compose.light.yml up -d
+# ============================================================
+
+services:
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openclaw
+    restart: unless-stopped
+    command: gateway
+
+    env_file:
+      - .env
+
+    environment:
+      - OPENCLAW_GATEWAY__HOST=0.0.0.0
+      - OPENCLAW_GATEWAY__PORT=18789
+      - TZ=${TZ:-Europe/Paris}
+
+    volumes:
+      - openclaw_memory:/data/memory
+      - openclaw_config:/data/config
+      - openclaw_logs:/data/logs
+      - openclaw_skills:/data/skills
+
+    ports:
+      - "${OPENCLAW_PORT:-18789}:18789"
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-512M}
+          cpus: "${CPU_LIMIT:-1.0}"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  openclaw_memory:
+  openclaw_config:
+  openclaw_logs:
+  openclaw_skills:
