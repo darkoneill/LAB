@@ -1,0 +1,51 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+dist
+build
+*.egg
+.venv
+venv
+env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Docker
+.dockerignore
+docker-compose*.yml
+Dockerfile
+
+# Documentation
+DOCKER.md
+*.md
+!openclaw/agent/prompts/*.md
+!openclaw/skills/builtin/*/SKILL.md
+
+# Runtime data
+openclaw/config/user.yaml
+openclaw/memory/store
+logs/
+*.log
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests
+tests/
+*.test.py

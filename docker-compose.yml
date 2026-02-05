@@ -1,0 +1,144 @@
+# ============================================================
+# OpenClaw NexusMind - Docker Compose
+# Deploiement complet pour VPS (Hostinger / Ubuntu)
+#
+# Usage:
+#   cp .env.example .env          # Configurer les cles API
+#   docker compose up -d          # Lancer en arriere-plan
+#   docker compose logs -f app    # Suivre les logs
+#   docker compose down           # Arreter
+# ============================================================
+
+services:
+
+  # ── OpenClaw Application ─────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openclaw
+    restart: unless-stopped
+    command: gateway
+
+    env_file:
+      - .env
+
+    environment:
+      - OPENCLAW_GATEWAY__HOST=0.0.0.0
+      - OPENCLAW_GATEWAY__PORT=18789
+      - TZ=${TZ:-Europe/Paris}
+
+    volumes:
+      - openclaw_memory:/data/memory
+      - openclaw_config:/data/config
+      - openclaw_logs:/data/logs
+      - openclaw_skills:/data/skills
+
+    ports:
+      - "${OPENCLAW_PORT:-18789}:18789"
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+
+    networks:
+      - openclaw_net
+
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-512M}
+          cpus: "${CPU_LIMIT:-1.0}"
+        reservations:
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Nginx Reverse Proxy ──────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: openclaw-nginx
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_cache:/var/cache/nginx
+      - certbot_www:/var/www/certbot:ro
+      - certbot_certs:/etc/letsencrypt:ro
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    networks:
+      - openclaw_net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ── Certbot (Let's Encrypt SSL) ─────────────────────────────
+  certbot:
+    image: certbot/certbot
+    container_name: openclaw-certbot
+    volumes:
+      - certbot_www:/var/www/certbot
+      - certbot_certs:/etc/letsencrypt
+    # Renouvellement auto : lancer periodiquement
+    # docker compose run --rm certbot renew
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do sleep 12h & wait $${!}; certbot renew; done'"
+
+    networks:
+      - openclaw_net
+
+  # ── Watchtower (mise a jour auto des containers) ─────────────
+  watchtower:
+    image: containrrr/watchtower
+    container_name: openclaw-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=86400  # 24h
+      - WATCHTOWER_LABEL_ENABLE=true
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+
+    profiles:
+      - auto-update  # Activer avec: docker compose --profile auto-update up -d
+
+# ── Volumes ──────────────────────────────────────────────────
+volumes:
+  openclaw_memory:
+    driver: local
+  openclaw_config:
+    driver: local
+  openclaw_logs:
+    driver: local
+  openclaw_skills:
+    driver: local
+  nginx_cache:
+    driver: local
+  certbot_www:
+    driver: local
+  certbot_certs:
+    driver: local
+
+# ── Network ──────────────────────────────────────────────────
+networks:
+  openclaw_net:
+    driver: bridge
