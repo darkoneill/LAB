@@ -307,8 +307,6 @@ Parle-moi naturellement. Je suis ton assistant IA polyvalent.
 
     def _show_skills(self):
         """Display available skills."""
-        from openclaw.skills import SkillRouter
-        # Skills are shown from the agent's skill router
         self.console.print("[primary]Skills disponibles :[/primary]")
         skills = []
         # Try to get from config paths

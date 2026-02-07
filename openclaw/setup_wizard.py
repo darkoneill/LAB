@@ -180,7 +180,11 @@ Ca prend moins de 2 minutes. C'est parti !
                 return True
 
         api_key = Prompt.ask("Cle API Anthropic (sk-ant-...)", password=True)
-        if api_key and api_key.startswith("sk-"):
+        # Anthropic keys start with sk-ant-api or similar patterns
+        if api_key and (api_key.startswith("sk-ant-") or api_key.startswith("sk-")):
+            if len(api_key) < 20:
+                console.print("[warning]Cle API trop courte. Verifie la cle.[/warning]")
+                return False
             self.settings.set("providers.anthropic.enabled", True, persist=True)
             self.settings.set("providers.anthropic.api_key", api_key, persist=True)
             console.print("[success]Anthropic configure ![/success]")
@@ -205,7 +209,11 @@ Ca prend moins de 2 minutes. C'est parti !
                 return True
 
         api_key = Prompt.ask("Cle API OpenAI (sk-...)", password=True)
-        if api_key and api_key.startswith("sk-"):
+        # OpenAI keys: sk-proj-..., sk-... (legacy), or custom formats
+        if api_key and (api_key.startswith("sk-") or api_key.startswith("sess-")):
+            if len(api_key) < 20:
+                console.print("[warning]Cle API trop courte. Verifie la cle.[/warning]")
+                return False
             self.settings.set("providers.openai.enabled", True, persist=True)
             self.settings.set("providers.openai.api_key", api_key, persist=True)
 

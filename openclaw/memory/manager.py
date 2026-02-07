@@ -246,10 +246,11 @@ class MemoryManager:
                     logger.error(f"Memory evolution error: {e}")
 
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                self._evolution_task = asyncio.create_task(evolution_loop())
+            # Use get_running_loop() which is the modern approach (Python 3.10+)
+            loop = asyncio.get_running_loop()
+            self._evolution_task = loop.create_task(evolution_loop())
         except RuntimeError:
+            # No running loop - will be started when initialize() is awaited
             pass
 
     async def _apply_forgetting(self):

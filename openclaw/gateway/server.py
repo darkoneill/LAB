@@ -20,6 +20,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from openclaw.config.settings import get_settings
+from openclaw.gateway.middleware import RateLimiter
 
 logger = logging.getLogger("openclaw.gateway")
 
@@ -174,6 +175,7 @@ class GatewayServer:
         self.skills = skill_router
         self.sessions = SessionManager()
         self.ws_manager = ConnectionManager()
+        self.rate_limiter = RateLimiter()
         self.start_time = time.time()
         self._setup_middleware()
         self._setup_routes()
@@ -195,13 +197,11 @@ class GatewayServer:
         # ── Health & Info ─────────────────────────────────
         @self.app.get("/health", response_model=HealthResponse)
         async def health():
-            import psutil
-            process = psutil.Process() if "psutil" in dir() else None
             mem = 0
             try:
-                import psutil as ps
-                mem = ps.Process().memory_info().rss / 1024 / 1024
-            except ImportError:
+                import psutil
+                mem = psutil.Process().memory_info().rss / 1024 / 1024
+            except (ImportError, Exception):
                 pass
             return HealthResponse(
                 status="healthy",
@@ -228,7 +228,23 @@ class GatewayServer:
 
         # ── Chat API ─────────────────────────────────────
         @self.app.post("/api/chat")
-        async def chat(request: ChatRequest):
+        async def chat(request: ChatRequest, req: Request):
+            # Get client identifier for rate limiting
+            client_id = req.headers.get("X-Client-Id", req.client.host if req.client else "unknown")
+
+            # Estimate tokens (rough: 4 chars = 1 token)
+            total_content = "".join(m.content for m in request.messages)
+            estimated_tokens = len(total_content) // 4 + (request.max_tokens or 1000)
+
+            # Check rate limit
+            allowed, rate_info = self.rate_limiter.check_limit(client_id, estimated_tokens)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content={"error": rate_info.get("reason", "Rate limit exceeded")},
+                    headers=self._rate_limit_headers(rate_info),
+                )
+
             session = self.sessions.get_or_create(request.session_id)
 
             # Store user message
@@ -243,22 +259,39 @@ class GatewayServer:
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
                         "X-Session-Id": session["id"],
+                        **self._rate_limit_headers(rate_info),
                     },
                 )
 
             # Non-streaming response
             response = await self._generate_response(session, request)
-            return response
+            return JSONResponse(
+                content=response.model_dump(),
+                headers=self._rate_limit_headers(rate_info),
+            )
 
         @self.app.post("/api/chat/simple")
         async def chat_simple(request: Request):
             """Simplified chat endpoint - just send text, get text back."""
+            # Get client identifier for rate limiting
+            client_id = request.headers.get("X-Client-Id", request.client.host if request.client else "unknown")
+
             body = await request.json()
             message = body.get("message", body.get("content", ""))
             session_id = body.get("session_id", None)
 
             if not message:
                 raise HTTPException(400, "Message is required")
+
+            # Estimate tokens and check rate limit
+            estimated_tokens = len(message) // 4 + 1000
+            allowed, rate_info = self.rate_limiter.check_limit(client_id, estimated_tokens)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content={"error": rate_info.get("reason", "Rate limit exceeded")},
+                    headers=self._rate_limit_headers(rate_info),
+                )
 
             session = self.sessions.get_or_create(session_id)
             self.sessions.add_message(session["id"], "user", message)
@@ -268,7 +301,10 @@ class GatewayServer:
                 session_id=session["id"],
             )
             response = await self._generate_response(session, chat_req)
-            return {"reply": response.content, "session_id": session["id"]}
+            return JSONResponse(
+                content={"reply": response.content, "session_id": session["id"]},
+                headers=self._rate_limit_headers(rate_info),
+            )
 
         # ── Sessions ─────────────────────────────────────
         @self.app.get("/api/sessions")
@@ -498,12 +534,40 @@ class GatewayServer:
                     })
         return models
 
+    def _rate_limit_headers(self, rate_info: dict) -> dict:
+        """Generate X-RateLimit-* headers from rate info."""
+        headers = {}
+        if rate_info:
+            if "requests_remaining" in rate_info:
+                headers["X-RateLimit-Remaining"] = str(rate_info["requests_remaining"])
+            if "tokens_remaining" in rate_info:
+                headers["X-RateLimit-Tokens-Remaining"] = str(rate_info["tokens_remaining"])
+            if "reset_at" in rate_info:
+                headers["X-RateLimit-Reset"] = str(int(rate_info["reset_at"]))
+        return headers
+
+    async def _session_cleanup_loop(self):
+        """Background task to clean up stale sessions periodically."""
+        while True:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            try:
+                before = self.sessions.active_count
+                self.sessions.cleanup_stale(max_age_seconds=7200)  # 2 hours
+                after = self.sessions.active_count
+                if before > after:
+                    logger.info(f"Cleaned up {before - after} stale sessions")
+            except Exception as e:
+                logger.error(f"Session cleanup error: {e}")
+
     async def start(self, host: str = None, port: int = None):
         """Start the gateway server."""
         import uvicorn
         host = host or self.settings.get("gateway.host", "127.0.0.1")
         port = port or self.settings.get("gateway.port", 18789)
         logger.info(f"Starting OpenClaw Gateway on {host}:{port}")
+
+        # Start background cleanup task
+        cleanup_task = asyncio.create_task(self._session_cleanup_loop())
 
         config = uvicorn.Config(
             self.app,
@@ -513,4 +577,11 @@ class GatewayServer:
             ws_ping_interval=self.settings.get("gateway.streaming.heartbeat_interval", 15),
         )
         server = uvicorn.Server(config)
-        await server.serve()
+        try:
+            await server.serve()
+        finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
