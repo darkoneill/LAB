@@ -80,9 +80,35 @@ class ToolExecutor:
 
         # Check blocked commands
         blocked = self.settings.get("tools.shell.blocked_commands", [])
+        # Normalize command for checking
+        cmd_lower = command.lower().strip()
+        cmd_parts = cmd_lower.split()
         for b in blocked:
-            if b in command:
-                return {"success": False, "error": f"Command blocked by security policy"}
+            b_lower = b.lower()
+            # Check if blocked pattern appears at start or after shell operators
+            if cmd_lower.startswith(b_lower):
+                return {"success": False, "error": "Command blocked by security policy"}
+            # Check after pipes, semicolons, &&, ||
+            for sep in ["|", ";", "&&", "||", "`", "$("]:
+                if sep in command:
+                    for part in command.split(sep):
+                        if part.strip().lower().startswith(b_lower):
+                            return {"success": False, "error": "Command blocked by security policy"}
+
+        # Additional dangerous pattern checks
+        dangerous_patterns = [
+            "rm -rf /",
+            "rm -fr /",
+            "dd if=/dev/zero of=/dev/sd",
+            "mkfs.",
+            "> /dev/sd",
+            "chmod -R 777 /",
+            "chown -R",
+            ":(){:|:&};:",  # Fork bomb
+        ]
+        for pattern in dangerous_patterns:
+            if pattern in cmd_lower:
+                return {"success": False, "error": "Command blocked by security policy"}
 
         timeout = timeout or self.settings.get("tools.shell.timeout_seconds", 120)
 

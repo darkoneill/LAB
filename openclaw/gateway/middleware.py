@@ -142,12 +142,13 @@ class RateLimiter:
         self._token_windows[client_id].append((time.time(), tokens))
 
 
-# ── Semantic Cache ───────────────────────────────────────────────────
+# ── Response Cache ───────────────────────────────────────────────────
 
 class SemanticCache:
     """
-    Semantic similarity-based response cache.
-    Caches responses for similar prompts to reduce cost and latency.
+    Response cache with exact matching and fuzzy similarity fallback.
+    Uses Jaccard token similarity when exact match fails.
+    Note: For true semantic similarity, integrate embeddings (sentence-transformers).
     """
 
     def __init__(self):
@@ -164,8 +165,9 @@ class SemanticCache:
         if not self.settings.get("gateway.cache.enabled", True):
             return None
 
-        cache_key = self._compute_key(prompt, model)
         now = time.time()
+        normalized = self._normalize(prompt)
+        cache_key = self._compute_key(normalized, model)
 
         # Exact match first
         if cache_key in self._cache:
@@ -176,6 +178,14 @@ class SemanticCache:
                 return entry["response"]
             else:
                 del self._cache[cache_key]
+
+        # Fuzzy match fallback (token overlap)
+        if self._similarity_threshold < 1.0:
+            best_match = self._find_similar(normalized, model, now)
+            if best_match:
+                best_match["hits"] += 1
+                logger.debug("Cache hit (fuzzy)")
+                return best_match["response"]
 
         return None
 
@@ -188,9 +198,12 @@ class SemanticCache:
         if len(self._cache) >= self._max_entries:
             self._evict_lru()
 
-        cache_key = self._compute_key(prompt, model)
+        normalized = self._normalize(prompt)
+        cache_key = self._compute_key(normalized, model)
         self._cache[cache_key] = {
             "prompt": prompt,
+            "normalized": normalized,
+            "tokens": set(normalized.split()),
             "model": model,
             "response": response,
             "timestamp": time.time(),
@@ -213,9 +226,45 @@ class SemanticCache:
             "total_hits": sum(e["hits"] for e in self._cache.values()),
         }
 
-    def _compute_key(self, prompt: str, model: str) -> str:
-        normalized = prompt.strip().lower()
+    def _normalize(self, text: str) -> str:
+        """Normalize prompt for comparison."""
+        text = text.lower().strip()
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'[^\w\s]', '', text)
+        return text
+
+    def _compute_key(self, normalized: str, model: str) -> str:
         return hashlib.sha256(f"{model}:{normalized}".encode()).hexdigest()
+
+    def _find_similar(self, normalized: str, model: str, now: float) -> Optional[dict]:
+        """Find a similar cached entry using Jaccard token similarity."""
+        query_tokens = set(normalized.split())
+        if not query_tokens:
+            return None
+
+        best_entry = None
+        best_score = 0.0
+
+        for entry in self._cache.values():
+            if entry["model"] != model:
+                continue
+            if now - entry["timestamp"] >= self._ttl:
+                continue
+
+            entry_tokens = entry.get("tokens", set())
+            if not entry_tokens:
+                continue
+
+            # Jaccard similarity: |A ∩ B| / |A ∪ B|
+            intersection = len(query_tokens & entry_tokens)
+            union = len(query_tokens | entry_tokens)
+            score = intersection / union if union > 0 else 0.0
+
+            if score >= self._similarity_threshold and score > best_score:
+                best_score = score
+                best_entry = entry
+
+        return best_entry
 
     def _evict_lru(self):
         """Evict least recently used entry."""

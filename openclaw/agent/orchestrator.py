@@ -114,14 +114,35 @@ Task: {message}"""
 
         try:
             content = result.get("content", "{}")
-            # Extract JSON from response
             import json
+            import re
+
+            # Try to find JSON object with expected keys
+            # Pattern matches { ... "should_delegate" ... }
+            json_pattern = r'\{[^{}]*"should_delegate"[^{}]*\}'
+            matches = re.findall(json_pattern, content, re.DOTALL)
+
+            if matches:
+                # Try the most complete match (longest)
+                for match in sorted(matches, key=len, reverse=True):
+                    try:
+                        parsed = json.loads(match)
+                        if "should_delegate" in parsed:
+                            return parsed
+                    except json.JSONDecodeError:
+                        continue
+
+            # Fallback: try extracting any valid JSON object
             start = content.find("{")
             end = content.rfind("}") + 1
             if start >= 0 and end > start:
-                return json.loads(content[start:end])
-        except (json.JSONDecodeError, ValueError):
-            pass
+                try:
+                    return json.loads(content[start:end])
+                except json.JSONDecodeError:
+                    pass
+
+        except Exception as e:
+            logger.debug(f"JSON parsing error in task analysis: {e}")
 
         return {"should_delegate": False, "complexity": "simple", "subtasks": [], "reasoning": ""}
 

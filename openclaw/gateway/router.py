@@ -46,7 +46,9 @@ class ProviderHealth:
         """Check if enough time has passed to retry an unhealthy provider."""
         if self.healthy:
             return True
-        backoff = min(60, 2 ** self.error_count)
+        # Cap exponent to prevent overflow (max backoff = 64 seconds)
+        capped_errors = min(self.error_count, 6)
+        backoff = min(60, 2 ** capped_errors)
         return (time.time() - self.last_error) > backoff
 
 

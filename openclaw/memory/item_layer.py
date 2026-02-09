@@ -3,6 +3,7 @@ Item Layer - Extracted memory units.
 Each item is the smallest meaningful unit that can be understood independently.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -17,6 +18,7 @@ class ItemLayer:
     """
     Stores discrete memory items extracted from resources.
     Items are the building blocks for categories and retrieval.
+    Thread-safe with asyncio.Lock for concurrent access.
     """
 
     def __init__(self, store_path: Path):
@@ -24,6 +26,7 @@ class ItemLayer:
         self.store_path.mkdir(parents=True, exist_ok=True)
         self._items: list[dict] = []
         self._index_path = self.store_path / "_index.json"
+        self._lock = asyncio.Lock()
 
     async def load(self):
         """Load items from disk."""
@@ -39,29 +42,31 @@ class ItemLayer:
 
     async def store(self, item: dict) -> str:
         """Store a new memory item."""
-        if "id" not in item:
-            item["id"] = f"item_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        if "created_at" not in item:
-            item["created_at"] = time.time()
-        if "access_count" not in item:
-            item["access_count"] = 0
-        if "significance" not in item:
-            item["significance"] = 0.5
-        if "last_accessed" not in item:
-            item["last_accessed"] = time.time()
+        async with self._lock:
+            if "id" not in item:
+                item["id"] = f"item_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            if "created_at" not in item:
+                item["created_at"] = time.time()
+            if "access_count" not in item:
+                item["access_count"] = 0
+            if "significance" not in item:
+                item["significance"] = 0.5
+            if "last_accessed" not in item:
+                item["last_accessed"] = time.time()
 
-        self._items.append(item)
-        await self._persist()
-        return item["id"]
+            self._items.append(item)
+            await self._persist_unlocked()
+            return item["id"]
 
     async def update(self, item_id: str, updates: dict):
         """Update an existing item."""
-        for item in self._items:
-            if item.get("id") == item_id:
-                item.update(updates)
-                await self._persist()
-                return True
-        return False
+        async with self._lock:
+            for item in self._items:
+                if item.get("id") == item_id:
+                    item.update(updates)
+                    await self._persist_unlocked()
+                    return True
+            return False
 
     async def get(self, item_id: str) -> Optional[dict]:
         """Get an item by ID and increment access count."""
@@ -124,12 +129,17 @@ class ItemLayer:
         # Combined score
         return (text_score * 0.4) + (significance * 0.3) + (recency_score * 0.2) + (min(access_count / 10, 1) * 0.1)
 
-    async def _persist(self):
-        """Save items to disk."""
+    async def _persist_unlocked(self):
+        """Save items to disk (caller must hold lock)."""
         self._index_path.write_text(
             json.dumps(self._items, indent=2, ensure_ascii=False, default=str),
             encoding="utf-8",
         )
+
+    async def _persist(self):
+        """Save items to disk with lock."""
+        async with self._lock:
+            await self._persist_unlocked()
 
     @property
     def count(self) -> int:
