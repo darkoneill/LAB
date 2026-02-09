@@ -230,6 +230,29 @@ sandbox:
   timeout: 30  # Default timeout in seconds
   workspace: "/tmp/openclaw-sandbox"
   network_enabled: false  # No network access by default
+  self_healing:
+    enabled: true           # Enable Self-Healing Code Loop (Proposition A)
+    max_attempts: 3         # Max LLM correction attempts before giving up
+
+# --- Tracing / Observability (Proposition B) ---
+tracing:
+  enabled: true
+  max_traces: 500           # Ring buffer size for in-memory traces
+  persist: true             # Write traces to JSON files
+  store_path: "logs/traces" # Directory for persisted trace files
+
+# --- Swarm Mode (Proposition C) ---
+# agent.swarm section for specialized sub-agents
+agent.swarm:
+  enabled: true
+  max_iterations: 3         # Max coder-reviewer loop iterations
+
+# --- MCP Approval / Human-in-the-Loop (Proposition D) ---
+mcp.approval:
+  enabled: true
+  timeout_seconds: 120      # Time before pending approval expires
+  auto_approve_safe: true   # Auto-approve read-only (safe) tools
+  tool_overrides: {}        # Custom overrides: tool_name -> safe|sensitive|critical
 
 # --- Logging ---
 logging:

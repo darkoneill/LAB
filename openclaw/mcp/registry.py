@@ -25,11 +25,12 @@ class MCPRegistry:
     - Graceful reconnection
     """
 
-    def __init__(self):
+    def __init__(self, approval_middleware=None):
         self.settings = get_settings()
         self._clients: dict[str, MCPClient] = {}
         self._tool_map: dict[str, str] = {}  # tool_name -> server_name
         self._initialized = False
+        self._approval_middleware = approval_middleware
 
     async def initialize(self):
         """Initialize and connect to all configured MCP servers."""
@@ -63,13 +64,20 @@ class MCPRegistry:
         self._initialized = True
         logger.info(f"MCP Registry initialized with {len(self._clients)} servers, {len(self._tool_map)} tools")
 
-    async def call_tool(self, tool_name: str, arguments: dict) -> dict:
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict,
+        session_id: str = "",
+    ) -> dict:
         """
         Call a tool by name, routing to the appropriate MCP server.
+        Integrates with ApprovalMiddleware for sensitive operations.
 
         Args:
             tool_name: Full or short tool name
             arguments: Tool arguments
+            session_id: Session ID for approval context
 
         Returns:
             Tool result
@@ -89,6 +97,24 @@ class MCPRegistry:
         actual_name = tool_name
         if tool_name.startswith(f"{server_name}_"):
             actual_name = tool_name[len(server_name) + 1:]
+
+        # Human-in-the-Loop approval check
+        if self._approval_middleware:
+            approved, reason = await self._approval_middleware.check_approval(
+                tool_name=actual_name,
+                server_name=server_name,
+                arguments=arguments,
+                session_id=session_id,
+            )
+            if not approved:
+                logger.warning(
+                    f"MCP tool call DENIED: {actual_name} (reason={reason})"
+                )
+                return {
+                    "success": False,
+                    "error": f"Tool call denied: {reason}",
+                    "approval_required": True,
+                }
 
         return await client.call_tool(actual_name, arguments)
 
