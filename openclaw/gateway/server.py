@@ -21,6 +21,9 @@ from pydantic import BaseModel, Field
 
 from openclaw.config.settings import get_settings
 from openclaw.gateway.middleware import RateLimiter
+from openclaw.gateway.approval import ApprovalMiddleware
+from openclaw.tracing import get_tracer
+from openclaw.tracing.recorder import SpanKind
 
 logger = logging.getLogger("openclaw.gateway")
 
@@ -176,6 +179,8 @@ class GatewayServer:
         self.sessions = SessionManager()
         self.ws_manager = ConnectionManager()
         self.rate_limiter = RateLimiter()
+        self.tracer = get_tracer()
+        self.approval = ApprovalMiddleware(ws_manager=self.ws_manager)
         self.start_time = time.time()
         self._setup_middleware()
         self._setup_routes()
@@ -381,6 +386,90 @@ class GatewayServer:
                 self.settings.set(dotpath, value, persist=True)
             return {"updated": list(body.keys())}
 
+        # ── Tracing / Observability API ─────────────────
+        @self.app.get("/api/traces")
+        async def list_traces(
+            session_id: str = None,
+            status: str = None,
+            limit: int = 50,
+            offset: int = 0,
+        ):
+            return {
+                "traces": self.tracer.list_traces(session_id, status, limit, offset),
+                "stats": self.tracer.get_stats(),
+            }
+
+        @self.app.get("/api/traces/{trace_id}")
+        async def get_trace(trace_id: str):
+            trace = self.tracer.get_trace(trace_id)
+            if not trace:
+                raise HTTPException(404, "Trace not found")
+            return trace
+
+        @self.app.get("/api/traces/search/{query}")
+        async def search_traces(query: str, limit: int = 20):
+            return {"results": self.tracer.search_traces(query, limit)}
+
+        @self.app.get("/api/traces/stats")
+        async def trace_stats():
+            return self.tracer.get_stats()
+
+        # ── Swarm API ───────────────────────────────────
+        @self.app.get("/api/swarm/profiles")
+        async def swarm_profiles():
+            from openclaw.agent.swarm import AGENT_PROFILES
+            return {
+                "profiles": {
+                    role: {
+                        "name": p["name"],
+                        "sandbox_access": p["sandbox_access"],
+                        "tools": p["tools"],
+                    }
+                    for role, p in AGENT_PROFILES.items()
+                }
+            }
+
+        @self.app.post("/api/swarm/execute")
+        async def swarm_execute(request: Request):
+            body = await request.json()
+            task = body.get("task", "")
+            roles = body.get("roles", None)
+            session_id = body.get("session_id", "")
+            if not task:
+                raise HTTPException(400, "Task is required")
+            if not self.agent:
+                raise HTTPException(503, "Agent brain not initialized")
+            from openclaw.agent.swarm import SwarmOrchestrator
+            swarm = SwarmOrchestrator(self.agent)
+            result = await swarm.execute_swarm(task, roles, session_id)
+            return {
+                "success": result.success,
+                "code": result.code,
+                "review": result.review,
+                "final_output": result.final_output,
+                "iterations": result.iterations,
+                "agents_used": result.agents_used,
+            }
+
+        # ── Approval API (Human-in-the-Loop) ────────────
+        @self.app.get("/api/approvals/pending")
+        async def pending_approvals():
+            return {"pending": self.approval.get_pending()}
+
+        @self.app.post("/api/approvals/{approval_id}")
+        async def resolve_approval(approval_id: str, request: Request):
+            body = await request.json()
+            approved = body.get("approved", False)
+            decided_by = body.get("decided_by", "user")
+            success = self.approval.resolve_approval(approval_id, approved, decided_by)
+            if not success:
+                raise HTTPException(404, "Approval request not found or already resolved")
+            return {"resolved": True, "approved": approved}
+
+        @self.app.get("/api/approvals/history")
+        async def approval_history(limit: int = 50):
+            return {"history": self.approval.get_history(limit)}
+
         # ── WebSocket ────────────────────────────────────
         @self.app.websocket("/ws/{client_id}")
         async def websocket_endpoint(websocket: WebSocket, client_id: str):
@@ -392,7 +481,20 @@ class GatewayServer:
                     data = await websocket.receive_json()
                     msg_type = data.get("type", "message")
 
-                    if msg_type == "message":
+                    if msg_type == "approval_response":
+                        # Handle approval decision from UI
+                        approval_id = data.get("approval_id", "")
+                        approved = data.get("approved", False)
+                        self.approval.resolve_approval(
+                            approval_id, approved, decided_by=client_id
+                        )
+                        await self.ws_manager.send_message(client_id, {
+                            "type": "approval_resolved",
+                            "approval_id": approval_id,
+                            "approved": approved,
+                        })
+
+                    elif msg_type == "message":
                         content = data.get("content", "")
                         self.sessions.add_message(session["id"], "user", content)
 
