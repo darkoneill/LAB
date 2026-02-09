@@ -50,6 +50,7 @@ agent:
   personality_file: "agent/prompts/personality.md"
   tools_prompt_file: "agent/prompts/tools.md"
   max_iterations: 25
+  chain_of_thought: true  # Enable CoT reasoning
   delegation:
     enabled: true
     max_depth: 3
@@ -104,7 +105,7 @@ providers:
     default_model: ""
     models: []
 
-# --- Memory Configuration (MemU-style) ---
+# --- Memory Configuration (MemU-style + RAG) ---
 memory:
   enabled: true
   store_path: "memory/store"
@@ -121,11 +122,20 @@ memory:
       enabled: true
       interval_minutes: 60
       reflection_depth: 3
+  vector:
+    enabled: true
+    collection: "openclaw_memory"
+    embedding_provider: "sentence-transformers"  # sentence-transformers, openai, default
+    model: "all-MiniLM-L6-v2"  # Fast, 384 dimensions
+    # Alternative models:
+    # - "all-mpnet-base-v2"  # Higher quality, 768 dimensions
+    # - "paraphrase-multilingual-MiniLM-L12-v2"  # Multilingual
   retrieval:
     method: "hybrid"  # hybrid, semantic, keyword
-    semantic_weight: 0.5
+    semantic_weight: 0.4
     keyword_weight: 0.3
     contextual_weight: 0.2
+    category_weight: 0.1
     top_k: 10
   forgetting:
     enabled: true
@@ -143,6 +153,9 @@ skills:
   skill_creation:
     enabled: true
     require_approval: true
+  web_search:
+    searxng_url: "http://searxng:8080"  # SearXNG instance URL
+    fallback_to_ddg: true  # Fall back to DuckDuckGo if SearXNG fails
 
 # --- Tools Configuration ---
 tools:
@@ -187,6 +200,36 @@ ui:
     theme: "dark"
     port: 18790
     auto_open: false
+
+# --- MCP (Model Context Protocol) ---
+mcp:
+  enabled: true
+  servers: {}
+  # Example MCP server configuration:
+  # servers:
+  #   filesystem:
+  #     enabled: true
+  #     transport: "stdio"
+  #     command: "npx"
+  #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+  #   github:
+  #     enabled: true
+  #     transport: "stdio"
+  #     command: "npx"
+  #     args: ["-y", "@modelcontextprotocol/server-github"]
+  #     env:
+  #       GITHUB_PERSONAL_ACCESS_TOKEN: ""
+
+# --- Sandbox Configuration ---
+sandbox:
+  enabled: true
+  force_all: false  # Force all commands through sandbox
+  image: "python:3.11-slim"  # Base image for sandboxes
+  memory_limit: "256m"
+  cpu_quota: 50000  # 50% of one CPU
+  timeout: 30  # Default timeout in seconds
+  workspace: "/tmp/openclaw-sandbox"
+  network_enabled: false  # No network access by default
 
 # --- Logging ---
 logging:

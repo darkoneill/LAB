@@ -1,6 +1,7 @@
 """
-Item Layer - Extracted memory units.
+Item Layer - Extracted memory units with vector embeddings.
 Each item is the smallest meaningful unit that can be understood independently.
+Enhanced with ChromaDB integration for semantic search (RAG).
 """
 
 import asyncio
@@ -11,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from openclaw.config.settings import get_settings
+
 logger = logging.getLogger("openclaw.memory.items")
 
 
@@ -19,6 +22,11 @@ class ItemLayer:
     Stores discrete memory items extracted from resources.
     Items are the building blocks for categories and retrieval.
     Thread-safe with asyncio.Lock for concurrent access.
+
+    Enhanced with:
+    - Vector embeddings via ChromaDB
+    - Semantic similarity search
+    - Hybrid retrieval (keyword + semantic)
     """
 
     def __init__(self, store_path: Path):
@@ -27,6 +35,23 @@ class ItemLayer:
         self._items: list[dict] = []
         self._index_path = self.store_path / "_index.json"
         self._lock = asyncio.Lock()
+        self._vector_store = None
+        self.settings = get_settings()
+
+    async def _get_vector_store(self):
+        """Lazy initialization of vector store."""
+        if self._vector_store is None and self.settings.get("memory.vector.enabled", True):
+            try:
+                from openclaw.memory.vector_store import VectorStore
+                self._vector_store = VectorStore(
+                    persist_dir=str(self.store_path / "vectors")
+                )
+                await self._vector_store.initialize()
+            except ImportError:
+                logger.warning("ChromaDB not available, using text-only search")
+            except Exception as e:
+                logger.error(f"Failed to initialize vector store: {e}")
+        return self._vector_store
 
     async def load(self):
         """Load items from disk."""
@@ -41,7 +66,7 @@ class ItemLayer:
         logger.info(f"Loaded {len(self._items)} memory items")
 
     async def store(self, item: dict) -> str:
-        """Store a new memory item."""
+        """Store a new memory item with vector embedding."""
         async with self._lock:
             if "id" not in item:
                 item["id"] = f"item_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -56,7 +81,25 @@ class ItemLayer:
 
             self._items.append(item)
             await self._persist_unlocked()
-            return item["id"]
+
+        # Add to vector store (outside lock to avoid blocking)
+        vector_store = await self._get_vector_store()
+        if vector_store and item.get("content"):
+            try:
+                await vector_store.add(
+                    content=item["content"],
+                    metadata={
+                        "item_id": item["id"],
+                        "category": item.get("category", ""),
+                        "significance": item.get("significance", 0.5),
+                        "created_at": item.get("created_at", 0),
+                    },
+                    doc_id=item["id"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to add item to vector store: {e}")
+
+        return item["id"]
 
     async def update(self, item_id: str, updates: dict):
         """Update an existing item."""
@@ -89,6 +132,72 @@ class ItemLayer:
 
         results.sort(key=lambda x: x.get("_score", 0), reverse=True)
         return results[:limit]
+
+    async def search_semantic(self, query: str, limit: int = 10) -> list[dict]:
+        """Semantic similarity search using vector embeddings."""
+        vector_store = await self._get_vector_store()
+        if not vector_store:
+            # Fallback to text search
+            return self.search_text(query, limit)
+
+        try:
+            results = await vector_store.search(query, top_k=limit)
+            # Enrich with full item data
+            enriched = []
+            for r in results:
+                item_id = r.get("id") or r.get("metadata", {}).get("item_id")
+                item = await self.get(item_id) if item_id else None
+                if item:
+                    enriched.append({
+                        **item,
+                        "_score": r.get("score", 0),
+                        "_semantic": True,
+                    })
+                else:
+                    # Item from vector store but not in index
+                    enriched.append({
+                        "id": item_id,
+                        "content": r.get("content", ""),
+                        "_score": r.get("score", 0),
+                        "_semantic": True,
+                    })
+            return enriched
+        except Exception as e:
+            logger.error(f"Semantic search failed: {e}")
+            return self.search_text(query, limit)
+
+    async def search_hybrid(self, query: str, limit: int = 10) -> list[dict]:
+        """
+        Hybrid search combining semantic and keyword matching.
+        Provides best of both worlds for RAG.
+        """
+        # Get results from both methods
+        text_results = self.search_text(query, limit * 2)
+        semantic_results = await self.search_semantic(query, limit * 2)
+
+        # Merge and deduplicate by ID
+        seen_ids = set()
+        merged = []
+
+        # Process semantic results first (usually more relevant)
+        for r in semantic_results:
+            item_id = r.get("id")
+            if item_id and item_id not in seen_ids:
+                seen_ids.add(item_id)
+                # Boost score for semantic matches
+                r["_score"] = r.get("_score", 0) * 1.2
+                merged.append(r)
+
+        # Add text results that weren't in semantic
+        for r in text_results:
+            item_id = r.get("id")
+            if item_id and item_id not in seen_ids:
+                seen_ids.add(item_id)
+                merged.append(r)
+
+        # Sort by score and return top results
+        merged.sort(key=lambda x: x.get("_score", 0), reverse=True)
+        return merged[:limit]
 
     def search_by_category(self, category: str, limit: int = 20) -> list[dict]:
         """Get items in a specific category."""
