@@ -1,11 +1,13 @@
 """
 Agent Brain - The reasoning engine.
 Multi-model, prompt-driven LLM layer inspired by AgentZero's architecture.
+Enhanced with Chain of Thought (CoT) reasoning for improved reliability.
 """
 
 import asyncio
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Optional, AsyncGenerator
@@ -14,6 +16,35 @@ from openclaw.config.settings import get_settings
 from openclaw.gateway.router import RequestRouter
 
 logger = logging.getLogger("openclaw.agent.brain")
+
+# Chain of Thought prompt injection
+COT_INSTRUCTION = """
+## Reasoning Protocol
+
+Before taking any action or responding, you MUST think through the problem step by step.
+Use <thinking>...</thinking> tags to show your reasoning process. This is mandatory.
+
+Structure your thinking:
+1. **Understand**: What is the user asking? What is the context?
+2. **Analyze**: What information or tools do I need? What are the constraints?
+3. **Plan**: What steps should I take? In what order?
+4. **Validate**: Is my plan safe? Are there any risks?
+
+After your thinking, provide your response or take action.
+
+Example:
+<thinking>
+The user wants to list files in a directory.
+I need to use the shell tool with 'ls -la'.
+This is a safe, read-only operation.
+</thinking>
+[Then execute the action or respond]
+
+IMPORTANT: Always show your thinking process. Never skip the <thinking> tags when:
+- Executing shell commands
+- Modifying files
+- Making decisions that affect system state
+"""
 
 
 class AgentBrain:
@@ -70,7 +101,40 @@ class AgentBrain:
             if skills_info:
                 parts.append(f"\n\n## Available Skills\n{skills_info}")
 
+        # Add Chain of Thought instruction
+        if self.settings.get("agent.chain_of_thought", True):
+            parts.append(COT_INSTRUCTION)
+
         return "\n".join(parts)
+
+    def _extract_thinking(self, content: str) -> tuple[str, str]:
+        """Extract thinking blocks from response content.
+
+        Returns:
+            tuple: (thinking_content, response_without_thinking)
+        """
+        thinking_pattern = r'<thinking>(.*?)</thinking>'
+        thinking_matches = re.findall(thinking_pattern, content, re.DOTALL)
+        thinking = "\n".join(thinking_matches).strip()
+
+        # Remove thinking blocks from visible response
+        clean_response = re.sub(thinking_pattern, '', content, flags=re.DOTALL).strip()
+
+        return thinking, clean_response
+
+    def _validate_thinking(self, thinking: str, action_type: str = None) -> bool:
+        """Validate that thinking contains required safety checks for dangerous actions."""
+        if not thinking:
+            return False
+
+        thinking_lower = thinking.lower()
+
+        # For shell commands, ensure safety was considered
+        if action_type == "shell":
+            safety_keywords = ["safe", "risk", "danger", "read-only", "harmless", "verify", "check"]
+            return any(kw in thinking_lower for kw in safety_keywords)
+
+        return True
 
     def _get_provider_client(self, provider_name: str):
         """Get an LLM client for the specified provider."""
@@ -182,6 +246,14 @@ class AgentBrain:
             result = await self._call_provider(provider_name, model_id, messages, system_msg, temp, max_tok)
             latency = (time.time() - start_time) * 1000
             self.router.record_success(provider_name, latency, result.get("usage", {}).get("total_tokens", 0))
+
+            # Extract and log thinking
+            if self.settings.get("agent.chain_of_thought", True):
+                thinking, clean_content = self._extract_thinking(result["content"])
+                if thinking:
+                    logger.debug(f"Agent thinking: {thinking[:200]}...")
+                    result["thinking"] = thinking
+                    result["content"] = clean_content
 
             # Handle tool calls
             if result.get("tool_calls") and self.tool_executor:
