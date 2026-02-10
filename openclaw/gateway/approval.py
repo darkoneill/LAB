@@ -17,6 +17,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, TYPE_CHECKING
@@ -113,7 +114,8 @@ class ApprovalMiddleware:
         self._auto_approve_safe = self.settings.get("mcp.approval.auto_approve_safe", True)
         self._ws_manager = ws_manager
         self._pending: dict[str, ApprovalRequest] = {}
-        self._history: list[dict] = []
+        self._max_history = 500
+        self._history: deque = deque(maxlen=self._max_history)
         self._custom_overrides: dict[str, ToolSafety] = {}
 
         # Load custom overrides from config
@@ -215,7 +217,7 @@ class ApprovalMiddleware:
             session_id=session_id,
         )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         request._future = loop.create_future()
         self._pending[request.id] = request
 
@@ -350,4 +352,4 @@ class ApprovalMiddleware:
 
     def get_history(self, limit: int = 50) -> list[dict]:
         """Get recent approval history."""
-        return self._history[-limit:]
+        return list(self._history)[-limit:]

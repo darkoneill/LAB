@@ -36,10 +36,12 @@ openclaw/
 ├── gateway/                # Gateway API (FastAPI + WebSocket)
 │   ├── server.py           # Serveur HTTP/WS avec SSE streaming
 │   ├── router.py           # Routage intelligent avec failover
-│   └── middleware.py       # Securite, rate limiting, cache semantique
+│   ├── middleware.py        # Securite, rate limiting, cache semantique
+│   └── approval.py         # Middleware d'approbation Human-in-the-Loop (MCP)
 ├── agent/                  # Cerveau de l'IA
 │   ├── brain.py            # Moteur de raisonnement multi-modele
 │   ├── orchestrator.py     # Orchestration multi-agent hierarchique
+│   ├── swarm.py            # Mode Swarm - sous-agents specialises (Coder/Reviewer/Tester)
 │   ├── context.py          # Gestion du contexte avec compression
 │   └── prompts/            # Templates de prompts (architecture AgentZero)
 ├── memory/                 # Systeme de memoire (architecture MemU)
@@ -49,6 +51,15 @@ openclaw/
 │   ├── category_layer.py   # Couche 3: Documents agregos lisibles
 │   ├── retrieval.py        # Recherche hybride (keyword + semantique + contextuel)
 │   └── evolution.py        # Auto-evolution et reflection
+├── tracing/                # Observabilite et Black Box Recorder
+│   ├── __init__.py         # Export du TraceRecorder
+│   └── recorder.py         # Enregistrement structure de chaque etape du pipeline
+├── sandbox/                # Execution isolee
+│   ├── container.py        # Gestion du cycle de vie des conteneurs Docker
+│   └── executor.py         # Executeur sandbox avec Self-Healing Code Loop
+├── mcp/                    # Model Context Protocol
+│   ├── client.py           # Client MCP (stdio/SSE)
+│   └── registry.py         # Registre multi-serveurs avec approbation
 ├── skills/                 # Systeme de skills modulaires
 │   ├── base.py             # Classe de base pour les skills
 │   ├── loader.py           # Decouverte et chargement dynamique
@@ -109,6 +120,148 @@ openclaw/
 - **Web** : SPA avec dark theme, WebSocket temps reel, chat + memoire + config
 - **Wizard** : installation guidee et conversationnelle
 
+---
+
+## Fonctionnalites Avancees (Sublimation)
+
+### A. Self-Healing Code Loop (Auto-Correction)
+
+L'agent peut debugger son propre code sans intervention humaine.
+
+**Principe** : Quand du code Python echoue dans le sandbox, le systeme intercepte l'erreur, la renvoie au LLM avec le code original, et le LLM produit une version corrigee. Max 3 tentatives.
+
+**Erreurs gerees** : `ModuleNotFoundError`, `SyntaxError`, `TypeError`, `NameError`, `ImportError`, `AttributeError`, `KeyError`, `IndexError`, `ValueError`, `FileNotFoundError`, `ZeroDivisionError`, `IndentationError`.
+
+**Configuration** (`config/default.yaml`) :
+```yaml
+sandbox:
+  self_healing:
+    enabled: true
+    max_attempts: 3
+```
+
+**Flux** :
+```
+Code Python -> Sandbox -> Erreur
+                           |
+                    LLM: "Corrige ce code"
+                           |
+                    Code corrige -> Sandbox -> Succes (ou retry)
+```
+
+### B. Observabilite / Black Box Recorder
+
+Chaque etape du pipeline est enregistree dans une trace structuree pour le debug et le replay.
+
+**Spans enregistres** : `REQUEST`, `RETRIEVAL`, `LLM_CALL`, `TOOL_EXEC`, `SELF_HEAL`, `DELEGATION`, `MCP_CALL`, `APPROVAL`, `RESPONSE`.
+
+**Stockage** :
+- Ring buffer en memoire (500 traces, acces O(1) par index)
+- Persistance JSON sur disque pour l'historique long terme
+
+**Configuration** :
+```yaml
+tracing:
+  enabled: true
+  max_traces: 500
+  persist: true
+  store_path: "logs/traces"
+```
+
+**API** :
+
+| Endpoint                      | Methode | Description              |
+|-------------------------------|---------|--------------------------|
+| `/api/traces`                 | GET     | Liste des traces         |
+| `/api/traces/stats`           | GET     | Statistiques (avg, p95)  |
+| `/api/traces/search/{query}`  | GET     | Recherche par contenu    |
+| `/api/traces/{trace_id}`      | GET     | Detail d'une trace       |
+
+### C. Mode Swarm (Essaim de Sous-Agents)
+
+L'orchestrateur peut creer des agents specialises avec des profils systeme distincts.
+
+**5 profils disponibles** :
+
+| Role       | Acces Sandbox | Description                              |
+|------------|---------------|------------------------------------------|
+| `coder`    | Read/Write    | Expert Python strict, code executable    |
+| `reviewer` | Read-Only     | Expert securite, cherche les failles     |
+| `planner`  | Aucun         | Architecte, decompose les taches         |
+| `tester`   | Read/Write    | Expert tests, ecrit des tests pytest     |
+| `researcher`| Aucun        | Recherche et analyse d'information       |
+
+**Boucle Coder-Reviewer** :
+```
+Coder ecrit le code
+       |
+Reviewer analyse -> APPROVED? -> Fin
+       |
+   Corrections necessaires
+       |
+Coder corrige (iteration N+1)
+```
+
+**Configuration** :
+```yaml
+agent:
+  swarm:
+    enabled: true
+    max_iterations: 3
+```
+
+**API** :
+
+| Endpoint               | Methode | Description                |
+|------------------------|---------|----------------------------|
+| `/api/swarm/profiles`  | GET     | Profils d'agents dispo     |
+| `/api/swarm/execute`   | POST    | Lancer un essaim           |
+
+### D. Interface MCP Human-in-the-Loop
+
+Les outils MCP sont classes par niveau de risque. Les operations sensibles necessitent l'approbation de l'utilisateur.
+
+**Classification automatique** :
+
+| Niveau     | Operations                                  | Comportement       |
+|------------|---------------------------------------------|---------------------|
+| `safe`     | `get_*`, `list_*`, `read_*`, `search_*`    | Auto-approuve       |
+| `sensitive`| `create_*`, `write_*`, `update_*`, `send_*` | Approbation requise |
+| `critical` | `delete_*`, `destroy_*`, `drop_*`, `kill_*` | Approbation requise |
+
+**Flux** :
+```
+Agent appelle un outil MCP sensible
+       |
+Middleware intercepte -> Notification WebSocket vers l'UI
+       |
+Utilisateur: "Autoriser" ou "Refuser"
+       |
+Execution ou annulation
+```
+
+**Configuration** :
+```yaml
+mcp:
+  approval:
+    enabled: true
+    timeout_seconds: 120
+    auto_approve_safe: true
+    tool_overrides: {}    # ex: { "my_tool": "safe" }
+```
+
+**API** :
+
+| Endpoint                       | Methode | Description                  |
+|--------------------------------|---------|------------------------------|
+| `/api/approvals/pending`       | GET     | Approbations en attente      |
+| `/api/approvals/{id}`          | POST    | Approuver/refuser            |
+| `/api/approvals/history`       | GET     | Historique des decisions      |
+
+**WebSocket** : Envoyer `{"type": "approval_response", "approval_id": "...", "approved": true}` pour repondre.
+
+---
+
 ## Configuration
 
 Variables d'environnement supportees :
@@ -149,6 +302,14 @@ OPENCLAW_LOGGING__LEVEL=DEBUG    # Niveau de log
 | `/api/skills`                     | GET     | Lister les skills              |
 | `/api/models`                     | GET     | Modeles disponibles            |
 | `/api/config`                     | GET/PUT | Configuration                  |
+| `/api/traces`                     | GET     | Traces du pipeline             |
+| `/api/traces/stats`               | GET     | Statistiques de tracing        |
+| `/api/traces/{id}`                | GET     | Detail d'une trace             |
+| `/api/swarm/profiles`             | GET     | Profils d'agents swarm         |
+| `/api/swarm/execute`              | POST    | Executer un essaim             |
+| `/api/approvals/pending`          | GET     | Approbations en attente        |
+| `/api/approvals/{id}`             | POST    | Approuver/refuser              |
+| `/api/approvals/history`          | GET     | Historique approbations        |
 | `/ws/{client_id}`                 | WS      | WebSocket temps reel           |
 
 ## Licence

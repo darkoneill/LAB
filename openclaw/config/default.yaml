@@ -55,6 +55,9 @@ agent:
     enabled: true
     max_depth: 3
     confirmation_required: false
+  swarm:                          # Swarm Mode - Proposition C
+    enabled: true
+    max_iterations: 3             # Max coder-reviewer loop iterations
   context:
     max_context_tokens: 128000
     compression_enabled: true
@@ -219,6 +222,11 @@ mcp:
   #     args: ["-y", "@modelcontextprotocol/server-github"]
   #     env:
   #       GITHUB_PERSONAL_ACCESS_TOKEN: ""
+  approval:                         # Human-in-the-Loop - Proposition D
+    enabled: true
+    timeout_seconds: 120            # Time before pending approval expires
+    auto_approve_safe: true         # Auto-approve read-only (safe) tools
+    tool_overrides: {}              # Custom overrides: tool_name -> safe|sensitive|critical
 
 # --- Sandbox Configuration ---
 sandbox:
@@ -240,19 +248,6 @@ tracing:
   max_traces: 500           # Ring buffer size for in-memory traces
   persist: true             # Write traces to JSON files
   store_path: "logs/traces" # Directory for persisted trace files
-
-# --- Swarm Mode (Proposition C) ---
-# agent.swarm section for specialized sub-agents
-agent.swarm:
-  enabled: true
-  max_iterations: 3         # Max coder-reviewer loop iterations
-
-# --- MCP Approval / Human-in-the-Loop (Proposition D) ---
-mcp.approval:
-  enabled: true
-  timeout_seconds: 120      # Time before pending approval expires
-  auto_approve_safe: true   # Auto-approve read-only (safe) tools
-  tool_overrides: {}        # Custom overrides: tool_name -> safe|sensitive|critical
 
 # --- Logging ---
 logging:

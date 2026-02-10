@@ -136,6 +136,7 @@ class TraceRecorder:
         self._max_traces = self.settings.get("tracing.max_traces", 500)
         self._persist = self.settings.get("tracing.persist", True)
         self._traces: deque[Trace] = deque(maxlen=self._max_traces)
+        self._trace_index: dict[str, Trace] = {}  # trace_id -> Trace (fast lookup)
         self._active_traces: dict[str, Trace] = {}
         self._trace_dir = Path(
             self.settings.get("tracing.store_path", "logs/traces")
@@ -197,7 +198,12 @@ class TraceRecorder:
         trace.finish(status)
 
         self._active_traces.pop(trace.trace_id, None)
+        # Evict oldest from index if deque is at capacity
+        if len(self._traces) >= self._traces.maxlen:
+            evicted = self._traces[0]
+            self._trace_index.pop(evicted.trace_id, None)
         self._traces.append(trace)
+        self._trace_index[trace.trace_id] = trace
 
         if self._persist:
             self._persist_trace(trace)
@@ -218,19 +224,27 @@ class TraceRecorder:
         except Exception as e:
             logger.error(f"Failed to persist trace {trace.trace_id}: {e}")
 
+    @staticmethod
+    def _sanitize_trace_id(trace_id: str) -> str:
+        """Sanitize trace_id to prevent path traversal attacks."""
+        import re as _re
+        return _re.sub(r"[^a-zA-Z0-9_\-]", "", trace_id)
+
     def get_trace(self, trace_id: str) -> Optional[dict]:
         """Retrieve a trace by ID (memory first, then disk)."""
         # Check active
         if trace_id in self._active_traces:
             return self._active_traces[trace_id].to_dict()
 
-        # Check ring buffer
-        for t in self._traces:
-            if t.trace_id == trace_id:
-                return t.to_dict()
+        # Check ring buffer (O(1) via index)
+        if trace_id in self._trace_index:
+            return self._trace_index[trace_id].to_dict()
 
-        # Check persisted
-        filepath = self._trace_dir / f"{trace_id}.json"
+        # Check persisted (sanitize to prevent path traversal)
+        safe_id = self._sanitize_trace_id(trace_id)
+        if not safe_id:
+            return None
+        filepath = self._trace_dir / f"{safe_id}.json"
         if filepath.exists():
             try:
                 return json.loads(filepath.read_text(encoding="utf-8"))
