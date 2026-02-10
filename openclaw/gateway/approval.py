@@ -88,7 +88,7 @@ class ApprovalRequest:
     tool_name: str = ""
     server_name: str = ""
     arguments: dict = field(default_factory=dict)
-    safety_level: str = ToolSafety.SENSITIVE
+    safety_level: ToolSafety = ToolSafety.SENSITIVE
     description: str = ""
     session_id: str = ""
     created_at: float = field(default_factory=time.time)
@@ -261,7 +261,7 @@ class ApprovalMiddleware:
             "id": request.id,
             "tool": tool_name,
             "server": server_name,
-            "safety": safety_level,
+            "safety": str(safety_level),  # Serialize enum to string for JSON
             "approved": approved,
             "reason": reason,
             "created_at": request.created_at,
@@ -281,7 +281,7 @@ class ApprovalMiddleware:
             "id": request.id,
             "tool_name": request.tool_name,
             "server_name": request.server_name,
-            "safety_level": request.safety_level,
+            "safety_level": str(request.safety_level),
             "description": request.description,
             "arguments_preview": self._safe_preview(request.arguments),
             "session_id": request.session_id,
@@ -455,24 +455,19 @@ class ApprovalMiddleware:
         trusted_tools = []
 
         for aid in approval_ids:
+            # Capture tool info BEFORE resolving (avoids race with async _history)
+            pending_req = self._pending.get(aid)
             success = self.resolve_approval(aid, approved, decided_by)
             if success:
                 resolved += 1
                 # Grant trust if requested and approved
-                if approved and trust_minutes > 0:
-                    request = None
-                    # Try to find in history (just resolved)
-                    for entry in reversed(list(self._history)):
-                        if entry.get("id") == aid:
-                            request = entry
-                            break
-                    if request:
-                        self.grant_trust(
-                            tool_name=request.get("tool", ""),
-                            server_name=request.get("server", ""),
-                            duration_minutes=trust_minutes,
-                        )
-                        trusted_tools.append(request.get("tool", ""))
+                if approved and trust_minutes > 0 and pending_req:
+                    self.grant_trust(
+                        tool_name=pending_req.tool_name,
+                        server_name=pending_req.server_name,
+                        duration_minutes=trust_minutes,
+                    )
+                    trusted_tools.append(pending_req.tool_name)
             else:
                 not_found += 1
 
@@ -498,7 +493,7 @@ class ApprovalMiddleware:
                 "id": r.id,
                 "tool": r.tool_name,
                 "server": r.server_name,
-                "safety": r.safety_level,
+                "safety": str(r.safety_level),
                 "description": r.description,
                 "created_at": r.created_at,
                 "timeout_seconds": self._timeout,

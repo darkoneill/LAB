@@ -350,7 +350,7 @@ mcp:
 | `/api/approvals/batch`         | POST    | Approbation par lots         |
 | `/api/approvals/trusted`       | GET     | Outils avec confiance active |
 | `/api/approvals/trust`         | POST    | Accorder confiance temp.     |
-| `/api/approvals/trust`         | DELETE  | Revoquer confiance           |
+| `/api/approvals/trust`         | DELETE  | Revoquer confiance (`?tool_name=X&server_name=Y`) |
 
 **WebSocket** : `{"type": "batch_approval", "approval_ids": [...], "approved": true, "trust_minutes": 15}`
 
@@ -407,7 +407,7 @@ OPENCLAW_LOGGING__LEVEL=DEBUG    # Niveau de log
 | `/api/approvals/batch`            | POST    | Approbation par lots (Whisper) |
 | `/api/approvals/trusted`          | GET     | Outils avec confiance temp.    |
 | `/api/approvals/trust`            | POST    | Accorder confiance temporaire  |
-| `/api/approvals/trust`            | DELETE  | Revoquer confiance             |
+| `/api/approvals/trust`            | DELETE  | Revoquer confiance (query params) |
 | `/ws/{client_id}`                 | WS      | WebSocket temps reel           |
 
 ## Licence
