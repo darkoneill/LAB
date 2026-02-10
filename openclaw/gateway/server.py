@@ -9,14 +9,12 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from openclaw.config.settings import get_settings
@@ -56,7 +54,7 @@ class ChatResponse(BaseModel):
     usage: dict = Field(default_factory=dict)
     tool_calls: list[dict] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class HealthResponse(BaseModel):
@@ -506,11 +504,8 @@ class GatewayServer:
             return {"trusted": True, "expires_at": expiry}
 
         @self.app.delete("/api/approvals/trust")
-        async def revoke_trust(request: Request):
-            """Revoke temporary trust."""
-            body = await request.json()
-            tool_name = body.get("tool_name", "")
-            server_name = body.get("server_name", "")
+        async def revoke_trust(tool_name: str = "", server_name: str = ""):
+            """Revoke temporary trust (use query params, not body)."""
             count = self.approval.revoke_trust(tool_name, server_name)
             return {"revoked": count}
 
@@ -530,18 +525,18 @@ class GatewayServer:
                         approval_id = data.get("approval_id", "")
                         approved = data.get("approved", False)
                         trust_minutes = data.get("trust_minutes", 0)
+                        # Capture tool info BEFORE resolving (avoids race with _history)
+                        pending_req = self.approval._pending.get(approval_id)
                         self.approval.resolve_approval(
                             approval_id, approved, decided_by=client_id
                         )
-                        # Grant trust if requested
-                        if approved and trust_minutes > 0:
-                            for req in self.approval.get_history(1):
-                                if req.get("id") == approval_id:
-                                    self.approval.grant_trust(
-                                        req.get("tool", ""),
-                                        req.get("server", ""),
-                                        trust_minutes,
-                                    )
+                        # Grant trust if requested and approved
+                        if approved and trust_minutes > 0 and pending_req:
+                            self.approval.grant_trust(
+                                pending_req.tool_name,
+                                pending_req.server_name,
+                                trust_minutes,
+                            )
                         await self.ws_manager.send_message(client_id, {
                             "type": "approval_resolved",
                             "approval_id": approval_id,

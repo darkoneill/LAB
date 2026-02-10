@@ -4,6 +4,7 @@ Automatically routes dangerous operations to isolated containers.
 Includes Self-Healing Code Loop: auto-corrects code errors via LLM retry.
 """
 
+import base64
 import logging
 import re
 import time
@@ -400,17 +401,21 @@ class SandboxExecutor:
                 }
 
             elif tool_name in ("write_file", "write"):
-                # Write file in sandbox
+                # Write file in sandbox (safe: base64-encode to avoid injection)
                 path = args.get("path", "")
                 content = args.get("content", "")
 
                 # Map to sandbox path
                 sandbox_path = f"/workspace/{path.lstrip('/')}"
-                write_cmd = f"mkdir -p $(dirname '{sandbox_path}') && cat > '{sandbox_path}'"
+                b64_content = base64.b64encode(content.encode("utf-8")).decode("ascii")
+                write_cmd = (
+                    f"mkdir -p \"$(dirname '{sandbox_path}')\" && "
+                    f"echo '{b64_content}' | base64 -d > '{sandbox_path}'"
+                )
 
                 result = await self.container_manager.execute_in_sandbox(
                     container_id,
-                    f"echo '{content}' | {write_cmd}",
+                    write_cmd,
                 )
                 return {
                     "success": result["success"],
