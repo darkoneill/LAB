@@ -4,7 +4,6 @@ Automatically routes dangerous operations to isolated containers.
 Includes Self-Healing Code Loop: auto-corrects code errors via LLM retry.
 """
 
-import asyncio
 import logging
 import re
 import time
@@ -287,10 +286,11 @@ class SandboxExecutor:
     def _strip_code_fences(code: str) -> str:
         """Remove markdown code fences from LLM output."""
         code = code.strip()
-        if code.startswith("```python"):
-            code = code[len("```python"):]
-        elif code.startswith("```"):
-            code = code[3:]
+        # Handle all common python fence variants
+        for prefix in ("```python", "```py", "```"):
+            if code.startswith(prefix):
+                code = code[len(prefix):]
+                break
         if code.endswith("```"):
             code = code[:-3]
         return code.strip()

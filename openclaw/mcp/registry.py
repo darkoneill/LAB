@@ -178,9 +178,11 @@ class MCPRegistry:
 _registry: Optional[MCPRegistry] = None
 
 
-def get_mcp_registry() -> MCPRegistry:
+def get_mcp_registry(approval_middleware=None) -> MCPRegistry:
     """Get the global MCP registry instance."""
     global _registry
     if _registry is None:
-        _registry = MCPRegistry()
+        _registry = MCPRegistry(approval_middleware=approval_middleware)
+    elif approval_middleware is not None and _registry._approval_middleware is None:
+        _registry._approval_middleware = approval_middleware
     return _registry

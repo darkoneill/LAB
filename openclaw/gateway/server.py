@@ -23,7 +23,6 @@ from openclaw.config.settings import get_settings
 from openclaw.gateway.middleware import RateLimiter
 from openclaw.gateway.approval import ApprovalMiddleware
 from openclaw.tracing import get_tracer
-from openclaw.tracing.recorder import SpanKind
 
 logger = logging.getLogger("openclaw.gateway")
 
@@ -399,20 +398,21 @@ class GatewayServer:
                 "stats": self.tracer.get_stats(),
             }
 
+        # Fixed: static routes BEFORE parameterized routes to avoid conflict
+        @self.app.get("/api/traces/stats")
+        async def trace_stats():
+            return self.tracer.get_stats()
+
+        @self.app.get("/api/traces/search/{query}")
+        async def search_traces(query: str, limit: int = 20):
+            return {"results": self.tracer.search_traces(query, limit)}
+
         @self.app.get("/api/traces/{trace_id}")
         async def get_trace(trace_id: str):
             trace = self.tracer.get_trace(trace_id)
             if not trace:
                 raise HTTPException(404, "Trace not found")
             return trace
-
-        @self.app.get("/api/traces/search/{query}")
-        async def search_traces(query: str, limit: int = 20):
-            return {"results": self.tracer.search_traces(query, limit)}
-
-        @self.app.get("/api/traces/stats")
-        async def trace_stats():
-            return self.tracer.get_stats()
 
         # ── Swarm API ───────────────────────────────────
         @self.app.get("/api/swarm/profiles")
