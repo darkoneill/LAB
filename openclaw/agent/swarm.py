@@ -29,6 +29,7 @@ class AgentRole(str, Enum):
     """Predefined specialized agent roles."""
     CODER = "coder"
     REVIEWER = "reviewer"
+    CRITIC = "critic"
     RESEARCHER = "researcher"
     PLANNER = "planner"
     TESTER = "tester"
@@ -68,6 +69,24 @@ AGENT_PROFILES: dict[str, dict] = {
         "max_tokens": 2048,
         "sandbox_access": "read_only",
         "tools": ["shell"],  # read-only commands only
+    },
+    AgentRole.CRITIC: {
+        "name": "Critic Agent",
+        "system_prompt": (
+            "Tu es un auditeur hostile et impartial. "
+            "Ton role est de chercher ACTIVEMENT les failles dans la reponse fournie : "
+            "1. Hallucinations : affirmations non fondees ou inventees "
+            "2. Erreurs logiques : raisonnements invalides, contradictions "
+            "3. Failles de securite : injections, fuites de donnees, SSRF "
+            "4. Cas limites : inputs vides, null, tres grands, caracteres speciaux "
+            "5. Omissions : exigences du cahier des charges ignorees "
+            "Sois impitoyable. Si tout est correct, reponds exactement: VALIDE. "
+            "Sinon, liste CHAQUE probleme avec [ERREUR], [SECURITE] ou [OMISSION]."
+        ),
+        "temperature": 0.1,  # Tres deterministe pour la critique
+        "max_tokens": 2048,
+        "sandbox_access": "none",
+        "tools": [],
     },
     AgentRole.RESEARCHER: {
         "name": "Researcher Agent",
@@ -130,8 +149,10 @@ class SwarmResult:
     success: bool = False
     code: str = ""
     review: str = ""
+    critic_verdict: str = ""
     final_output: str = ""
     iterations: int = 0
+    validated: bool = False
     agents_used: list[str] = field(default_factory=list)
     trace: list[dict] = field(default_factory=list)
 
@@ -273,6 +294,39 @@ class SwarmOrchestrator:
                 if AgentRole.TESTER not in swarm_result.agents_used:
                     swarm_result.agents_used.append(AgentRole.TESTER)
 
+        # Phase 3: Critic validation (final gate before returning to user)
+        if AgentRole.CRITIC in roles and (current_code or review_feedback):
+            output_to_validate = current_code or review_feedback
+            critic_task = (
+                f"Voici la reponse finale produite par l'essaim d'agents pour la tache suivante.\n\n"
+                f"TACHE ORIGINALE:\n{task[:500]}\n\n"
+                f"REPONSE A VALIDER:\n{output_to_validate}\n\n"
+                f"Analyse cette reponse en tant qu'auditeur hostile. "
+                f"Cherche les hallucinations, erreurs logiques, failles de securite, "
+                f"cas limites non geres, et omissions. "
+                f"Si tout est correct, reponds exactement: VALIDE"
+            )
+
+            critic_verdict = await self._run_agent(AgentRole.CRITIC, critic_task)
+            swarm_result.critic_verdict = critic_verdict
+            if AgentRole.CRITIC not in swarm_result.agents_used:
+                swarm_result.agents_used.append(AgentRole.CRITIC)
+
+            trace.append({
+                "phase": "critic_validation",
+                "output": critic_verdict[:1000],
+                "validated": "VALIDE" in critic_verdict.upper(),
+            })
+
+            swarm_result.validated = "VALIDE" in critic_verdict.upper()
+
+            if not swarm_result.validated:
+                logger.warning(
+                    f"Swarm: Critic REJECTED the output. Issues found."
+                )
+            else:
+                logger.info("Swarm: Critic VALIDATED the output.")
+
         # Finalize
         swarm_result.success = True
         swarm_result.final_output = current_code or review_feedback
@@ -280,7 +334,7 @@ class SwarmOrchestrator:
 
         logger.info(
             f"Swarm completed: {swarm_result.iterations} iterations, "
-            f"agents={swarm_result.agents_used}"
+            f"agents={swarm_result.agents_used}, validated={swarm_result.validated}"
         )
         return swarm_result
 

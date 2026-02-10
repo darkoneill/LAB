@@ -446,6 +446,8 @@ class GatewayServer:
                 "success": result.success,
                 "code": result.code,
                 "review": result.review,
+                "critic_verdict": result.critic_verdict,
+                "validated": result.validated,
                 "final_output": result.final_output,
                 "iterations": result.iterations,
                 "agents_used": result.agents_used,

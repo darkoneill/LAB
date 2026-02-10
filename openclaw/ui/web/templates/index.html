@@ -18,6 +18,9 @@
                 <button class="nav-btn active" data-view="chat">
                     <span class="icon">&#9776;</span> Chat
                 </button>
+                <button class="nav-btn" data-view="traces">
+                    <span class="icon">&#9673;</span> Mission Control
+                </button>
                 <button class="nav-btn" data-view="memory">
                     <span class="icon">&#9733;</span> Memoire
                 </button>
@@ -55,6 +58,64 @@
                 </div>
             </div>
 
+            <!-- Mission Control / Traces View -->
+            <div id="view-traces" class="view">
+                <div class="traces-header">
+                    <h2>Mission Control</h2>
+                    <div class="traces-controls">
+                        <button id="traces-refresh" class="btn-sm">Rafraichir</button>
+                        <span id="traces-stats" class="traces-stats-badge"></span>
+                    </div>
+                </div>
+
+                <!-- Stats bar -->
+                <div id="traces-stats-bar" class="stats-bar">
+                    <div class="stat-card">
+                        <span class="stat-value" id="stat-total">0</span>
+                        <span class="stat-label">Total</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-value" id="stat-active">0</span>
+                        <span class="stat-label">Actives</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-value" id="stat-avg">0ms</span>
+                        <span class="stat-label">Duree moy.</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-value" id="stat-errors">0</span>
+                        <span class="stat-label">Erreurs</span>
+                    </div>
+                </div>
+
+                <!-- Traces list + detail split view -->
+                <div class="traces-split">
+                    <!-- Left: trace list -->
+                    <div class="traces-list" id="traces-list">
+                        <div class="traces-empty">Aucune trace. Envoie un message pour commencer.</div>
+                    </div>
+
+                    <!-- Right: trace detail (span tree) -->
+                    <div class="trace-detail" id="trace-detail">
+                        <div class="trace-detail-empty">
+                            Selectionne une trace pour voir l'arbre de decision.
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Approval notifications overlay -->
+                <div id="approval-banner" class="approval-banner hidden">
+                    <div class="approval-content">
+                        <span class="approval-icon">&#9888;</span>
+                        <span id="approval-text"></span>
+                        <div class="approval-actions">
+                            <button id="approval-accept" class="btn-approve">Autoriser</button>
+                            <button id="approval-deny" class="btn-deny">Refuser</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Memory View -->
             <div id="view-memory" class="view">
                 <h2>Memoire</h2>
@@ -80,5 +141,6 @@
         </main>
     </div>
     <script src="/static/js/app.js"></script>
+    <script src="/static/js/mission-control.js"></script>
 </body>
 </html>
