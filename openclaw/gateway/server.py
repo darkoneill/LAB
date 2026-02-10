@@ -446,6 +446,8 @@ class GatewayServer:
                 "success": result.success,
                 "code": result.code,
                 "review": result.review,
+                "critic_verdict": result.critic_verdict,
+                "validated": result.validated,
                 "final_output": result.final_output,
                 "iterations": result.iterations,
                 "agents_used": result.agents_used,
@@ -470,6 +472,48 @@ class GatewayServer:
         async def approval_history(limit: int = 50):
             return {"history": self.approval.get_history(limit)}
 
+        # ── Whisper Mode: Batch Approval + Trust ─────────
+        @self.app.post("/api/approvals/batch")
+        async def batch_approval(request: Request):
+            """Resolve multiple approvals at once (Whisper Mode)."""
+            body = await request.json()
+            approval_ids = body.get("approval_ids", [])
+            approved = body.get("approved", False)
+            decided_by = body.get("decided_by", "user")
+            trust_minutes = body.get("trust_minutes", 0)
+            if not approval_ids:
+                raise HTTPException(400, "approval_ids list is required")
+            result = self.approval.resolve_batch(
+                approval_ids, approved, decided_by, trust_minutes
+            )
+            return result
+
+        @self.app.get("/api/approvals/trusted")
+        async def list_trusted():
+            """List tools with active temporary trust."""
+            return {"trusted": self.approval.get_trusted()}
+
+        @self.app.post("/api/approvals/trust")
+        async def grant_trust(request: Request):
+            """Grant temporary trust to a tool."""
+            body = await request.json()
+            tool_name = body.get("tool_name", "")
+            server_name = body.get("server_name", "")
+            duration = body.get("duration_minutes", 0)
+            if not tool_name:
+                raise HTTPException(400, "tool_name is required")
+            expiry = self.approval.grant_trust(tool_name, server_name, duration)
+            return {"trusted": True, "expires_at": expiry}
+
+        @self.app.delete("/api/approvals/trust")
+        async def revoke_trust(request: Request):
+            """Revoke temporary trust."""
+            body = await request.json()
+            tool_name = body.get("tool_name", "")
+            server_name = body.get("server_name", "")
+            count = self.approval.revoke_trust(tool_name, server_name)
+            return {"revoked": count}
+
         # ── WebSocket ────────────────────────────────────
         @self.app.websocket("/ws/{client_id}")
         async def websocket_endpoint(websocket: WebSocket, client_id: str):
@@ -485,13 +529,36 @@ class GatewayServer:
                         # Handle approval decision from UI
                         approval_id = data.get("approval_id", "")
                         approved = data.get("approved", False)
+                        trust_minutes = data.get("trust_minutes", 0)
                         self.approval.resolve_approval(
                             approval_id, approved, decided_by=client_id
                         )
+                        # Grant trust if requested
+                        if approved and trust_minutes > 0:
+                            for req in self.approval.get_history(1):
+                                if req.get("id") == approval_id:
+                                    self.approval.grant_trust(
+                                        req.get("tool", ""),
+                                        req.get("server", ""),
+                                        trust_minutes,
+                                    )
                         await self.ws_manager.send_message(client_id, {
                             "type": "approval_resolved",
                             "approval_id": approval_id,
                             "approved": approved,
+                        })
+
+                    elif msg_type == "batch_approval":
+                        # Whisper Mode: batch approve/deny multiple operations
+                        approval_ids = data.get("approval_ids", [])
+                        approved = data.get("approved", False)
+                        trust_minutes = data.get("trust_minutes", 0)
+                        result = self.approval.resolve_batch(
+                            approval_ids, approved, client_id, trust_minutes
+                        )
+                        await self.ws_manager.send_message(client_id, {
+                            "type": "batch_resolved",
+                            **result,
                         })
 
                     elif msg_type == "message":

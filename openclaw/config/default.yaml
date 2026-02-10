@@ -145,6 +145,12 @@ memory:
     decay_rate: 0.01
     min_access_count: 2
     grace_period_days: 30
+  episodic:                           # Memoire Episodique Narrative
+    enabled: true
+    file: "PROJECT_MEMORY.md"         # Fichier de memoire narrative
+    min_exchanges: 5                  # Min echanges avant consolidation
+    min_interval_seconds: 21600       # 6 heures entre consolidations
+    max_chapters_in_context: 3        # Chapitres recents injectes dans le contexte
 
 # --- Skills Configuration ---
 skills:
@@ -226,6 +232,7 @@ mcp:
     enabled: true
     timeout_seconds: 120            # Time before pending approval expires
     auto_approve_safe: true         # Auto-approve read-only (safe) tools
+    trust_duration_minutes: 5       # Default trust duration (Whisper Mode)
     tool_overrides: {}              # Custom overrides: tool_name -> safe|sensitive|critical
 
 # --- Sandbox Configuration ---
