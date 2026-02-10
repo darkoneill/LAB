@@ -109,7 +109,15 @@
                         <span class="approval-icon">&#9888;</span>
                         <span id="approval-text"></span>
                         <div class="approval-actions">
+                            <select id="trust-duration" class="trust-select" title="Confiance temporaire">
+                                <option value="0">Pas de confiance</option>
+                                <option value="5">5 min</option>
+                                <option value="15">15 min</option>
+                                <option value="30">30 min</option>
+                                <option value="60">1 heure</option>
+                            </select>
                             <button id="approval-accept" class="btn-approve">Autoriser</button>
+                            <button id="approval-batch" class="btn-approve hidden">Tout autoriser</button>
                             <button id="approval-deny" class="btn-deny">Refuser</button>
                         </div>
                     </div>

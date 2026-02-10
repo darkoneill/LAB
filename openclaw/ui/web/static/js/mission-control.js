@@ -148,44 +148,113 @@
   }
 
   // ── Approval handling ─────────────────────────────────────────
+  // Track pending approvals for batch mode (Whisper Mode)
+  let pendingApprovals = [];
+
   function showApprovalBanner(data) {
     const banner = document.getElementById('approval-banner');
     const text = document.getElementById('approval-text');
     if (!banner || !text) return;
 
     currentApprovalId = data.id;
-    text.textContent = data.description || `L'agent veut executer: ${data.tool_name}`;
+
+    // Add to pending list for batch mode
+    if (!pendingApprovals.find(a => a.id === data.id)) {
+      pendingApprovals.push({
+        id: data.id,
+        tool_name: data.tool_name,
+        description: data.description,
+        safety_level: data.safety_level,
+      });
+    }
+
+    // Update banner text
+    if (pendingApprovals.length > 1) {
+      text.textContent = pendingApprovals.length + ' operations en attente - Mode Whisper disponible';
+    } else {
+      text.textContent = data.description || "L'agent veut executer: " + data.tool_name;
+    }
     banner.classList.remove('hidden');
+
+    // Show batch button if multiple pending
+    updateBatchButton();
   }
 
   function hideApprovalBanner() {
     const banner = document.getElementById('approval-banner');
     if (banner) banner.classList.add('hidden');
     currentApprovalId = null;
+    pendingApprovals = [];
+    updateBatchButton();
+  }
+
+  function updateBatchButton() {
+    var batchBtn = document.getElementById('approval-batch');
+    if (!batchBtn) return;
+    if (pendingApprovals.length > 1) {
+      batchBtn.classList.remove('hidden');
+      batchBtn.textContent = 'Tout autoriser (' + pendingApprovals.length + ')';
+    } else {
+      batchBtn.classList.add('hidden');
+    }
   }
 
   async function resolveApproval(approved) {
     if (!currentApprovalId) return;
+    var trustMinutes = getTrustDuration();
     try {
-      // Try WebSocket first if available
       if (window.ws && window.ws.readyState === WebSocket.OPEN) {
         window.ws.send(JSON.stringify({
           type: 'approval_response',
           approval_id: currentApprovalId,
           approved: approved,
+          trust_minutes: trustMinutes,
         }));
       } else {
-        // Fallback to REST
         await fetch(API + '/api/approvals/' + currentApprovalId, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ approved: approved }),
+          body: JSON.stringify({ approved: approved, trust_minutes: trustMinutes }),
         });
       }
     } catch (e) {
       console.error('Failed to resolve approval:', e);
     }
     hideApprovalBanner();
+  }
+
+  async function resolveBatchApproval() {
+    if (pendingApprovals.length === 0) return;
+    var ids = pendingApprovals.map(function(a) { return a.id; });
+    var trustMinutes = getTrustDuration();
+    try {
+      if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+        window.ws.send(JSON.stringify({
+          type: 'batch_approval',
+          approval_ids: ids,
+          approved: true,
+          trust_minutes: trustMinutes,
+        }));
+      } else {
+        await fetch(API + '/api/approvals/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            approval_ids: ids,
+            approved: true,
+            trust_minutes: trustMinutes,
+          }),
+        });
+      }
+    } catch (e) {
+      console.error('Failed to batch approve:', e);
+    }
+    hideApprovalBanner();
+  }
+
+  function getTrustDuration() {
+    var select = document.getElementById('trust-duration');
+    return select ? parseInt(select.value, 10) || 0 : 0;
   }
 
   // ── WebSocket listener for live updates ───────────────────────
@@ -220,8 +289,10 @@
     // Approval buttons
     const acceptBtn = document.getElementById('approval-accept');
     const denyBtn = document.getElementById('approval-deny');
+    const batchBtn = document.getElementById('approval-batch');
     if (acceptBtn) acceptBtn.addEventListener('click', () => resolveApproval(true));
     if (denyBtn) denyBtn.addEventListener('click', () => resolveApproval(false));
+    if (batchBtn) batchBtn.addEventListener('click', () => resolveBatchApproval());
 
     // Auto-load traces when switching to view
     const observer = new MutationObserver(function () {

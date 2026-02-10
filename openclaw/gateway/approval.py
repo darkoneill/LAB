@@ -105,6 +105,10 @@ class ApprovalMiddleware:
 
     Integrates with the WebSocket ConnectionManager to send real-time
     approval notifications to the UI.
+
+    Features:
+    - Whisper Mode: batch approval for multiple pending operations
+    - Temporary Trust: trust a tool/server for N minutes after approval
     """
 
     def __init__(self, ws_manager: "ConnectionManager" = None):
@@ -112,11 +116,14 @@ class ApprovalMiddleware:
         self._enabled = self.settings.get("mcp.approval.enabled", True)
         self._timeout = self.settings.get("mcp.approval.timeout_seconds", 120)
         self._auto_approve_safe = self.settings.get("mcp.approval.auto_approve_safe", True)
+        self._trust_duration = self.settings.get("mcp.approval.trust_duration_minutes", 0)
         self._ws_manager = ws_manager
         self._pending: dict[str, ApprovalRequest] = {}
         self._max_history = 500
         self._history: deque = deque(maxlen=self._max_history)
         self._custom_overrides: dict[str, ToolSafety] = {}
+        # Temporary trust store: {tool_key: expiry_timestamp}
+        self._trusted: dict[str, float] = {}
 
         # Load custom overrides from config
         config_overrides = self.settings.get("mcp.approval.tool_overrides", {})
@@ -186,6 +193,12 @@ class ApprovalMiddleware:
         if safety == ToolSafety.SAFE and self._auto_approve_safe:
             logger.debug(f"Tool '{tool_name}' auto-approved (safe)")
             return True, "auto_approved_safe"
+
+        # Check temporary trust (Whisper Mode)
+        trust_key = self._trust_key(tool_name, server_name)
+        if self._is_trusted(trust_key):
+            logger.debug(f"Tool '{tool_name}' auto-approved (temporary trust)")
+            return True, "trusted"
 
         # Sensitive/Critical tools need approval
         return await self._request_approval(
@@ -334,6 +347,149 @@ class ApprovalMiddleware:
                 str_val = "***REDACTED***"
             preview[key] = str_val
         return preview
+
+    # ── Temporary Trust (Whisper Mode) ───────────────────────────────
+
+    @staticmethod
+    def _trust_key(tool_name: str, server_name: str) -> str:
+        """Generate a trust key for a tool+server combination."""
+        return f"{server_name}::{tool_name}" if server_name else tool_name
+
+    def _is_trusted(self, trust_key: str) -> bool:
+        """Check if a tool is temporarily trusted and not expired."""
+        expiry = self._trusted.get(trust_key)
+        if expiry is None:
+            return False
+        if time.time() > expiry:
+            # Expired - clean up
+            self._trusted.pop(trust_key, None)
+            return False
+        return True
+
+    def grant_trust(
+        self,
+        tool_name: str,
+        server_name: str = "",
+        duration_minutes: int = 0,
+    ) -> float:
+        """
+        Grant temporary trust to a tool for N minutes.
+
+        Args:
+            tool_name: The tool name (or "*" for all tools on a server).
+            server_name: The MCP server name.
+            duration_minutes: Trust duration in minutes (0 = use config default).
+
+        Returns:
+            The trust expiry timestamp.
+        """
+        minutes = duration_minutes or self._trust_duration
+        if minutes <= 0:
+            minutes = 5  # Default 5 minutes if nothing configured
+
+        expiry = time.time() + (minutes * 60)
+        trust_key = self._trust_key(tool_name, server_name)
+        self._trusted[trust_key] = expiry
+
+        logger.info(
+            f"Trust granted: {trust_key} for {minutes}min (expires {expiry})"
+        )
+        return expiry
+
+    def revoke_trust(self, tool_name: str = "", server_name: str = ""):
+        """Revoke temporary trust. If no args, revokes all trust."""
+        if not tool_name and not server_name:
+            count = len(self._trusted)
+            self._trusted.clear()
+            logger.info(f"All temporary trust revoked ({count} entries)")
+            return count
+
+        trust_key = self._trust_key(tool_name, server_name)
+        removed = self._trusted.pop(trust_key, None)
+        if removed:
+            logger.info(f"Trust revoked: {trust_key}")
+        return 1 if removed else 0
+
+    def get_trusted(self) -> list[dict]:
+        """List all currently trusted tools with their expiry times."""
+        now = time.time()
+        # Clean expired entries while listing
+        active = {}
+        for key, expiry in self._trusted.items():
+            if expiry > now:
+                active[key] = expiry
+        self._trusted = active
+
+        return [
+            {
+                "trust_key": key,
+                "expires_at": expiry,
+                "remaining_seconds": int(expiry - now),
+            }
+            for key, expiry in active.items()
+        ]
+
+    # ── Batch Approval (Whisper Mode) ─────────────────────────────────
+
+    def resolve_batch(
+        self,
+        approval_ids: list[str],
+        approved: bool,
+        decided_by: str = "user",
+        trust_minutes: int = 0,
+    ) -> dict:
+        """
+        Resolve multiple pending approvals at once (Whisper Mode).
+
+        Args:
+            approval_ids: List of approval IDs to resolve.
+            approved: Whether to approve or deny all.
+            decided_by: Who made the decision.
+            trust_minutes: If > 0, grant temporary trust for approved tools.
+
+        Returns:
+            Summary with resolved/not_found counts.
+        """
+        resolved = 0
+        not_found = 0
+        trusted_tools = []
+
+        for aid in approval_ids:
+            success = self.resolve_approval(aid, approved, decided_by)
+            if success:
+                resolved += 1
+                # Grant trust if requested and approved
+                if approved and trust_minutes > 0:
+                    request = None
+                    # Try to find in history (just resolved)
+                    for entry in reversed(list(self._history)):
+                        if entry.get("id") == aid:
+                            request = entry
+                            break
+                    if request:
+                        self.grant_trust(
+                            tool_name=request.get("tool", ""),
+                            server_name=request.get("server", ""),
+                            duration_minutes=trust_minutes,
+                        )
+                        trusted_tools.append(request.get("tool", ""))
+            else:
+                not_found += 1
+
+        logger.info(
+            f"Batch approval: {resolved} resolved, {not_found} not found, "
+            f"{'approved' if approved else 'denied'}"
+        )
+
+        return {
+            "resolved": resolved,
+            "not_found": not_found,
+            "approved": approved,
+            "trust_minutes": trust_minutes if approved else 0,
+            "trusted_tools": trusted_tools,
+        }
+
+    # ── Queries ───────────────────────────────────────────────────────
 
     def get_pending(self) -> list[dict]:
         """List all pending approval requests."""

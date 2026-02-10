@@ -50,7 +50,7 @@ openclaw/
 │   ├── item_layer.py       # Couche 2: Unites de memoire extraites
 │   ├── category_layer.py   # Couche 3: Documents agregos lisibles
 │   ├── retrieval.py        # Recherche hybride (keyword + semantique + contextuel)
-│   └── evolution.py        # Auto-evolution et reflection
+│   └── evolution.py        # Auto-evolution, reflection + memoire episodique narrative
 ├── tracing/                # Observabilite et Black Box Recorder
 │   ├── __init__.py         # Export du TraceRecorder
 │   └── recorder.py         # Enregistrement structure de chaque etape du pipeline
@@ -262,6 +262,100 @@ mcp:
 
 ---
 
+## Sublimation II - Ameliorations Avancees
+
+### E. Agent Critique (Validation Hostile)
+
+Un 6e profil d'agent dans le Swarm : le **Critic**, auditeur hostile et impartial.
+
+**Role** : Apres la boucle Coder-Reviewer, le Critic valide la sortie finale en cherchant activement :
+- Hallucinations et affirmations non fondees
+- Erreurs logiques et contradictions
+- Failles de securite (injections, fuites de donnees)
+- Cas limites non geres
+- Omissions du cahier des charges
+
+**Flux** :
+```
+Coder -> Reviewer -> APPROVED -> Critic -> VALIDE? -> Retour utilisateur
+                                    |
+                                 REJETE -> Log warning + retour avec avertissement
+```
+
+### F. Mission Control (Visualisation des Traces)
+
+Interface web dediee pour visualiser l'arbre de decision de l'agent en temps reel.
+
+**Fonctionnalites** :
+- Vue split : liste des traces (gauche) + arbre de spans (droite)
+- Barre de stats : total, actives, duree moyenne, erreurs
+- Icones et couleurs par type de span (LLM, outil, self-heal, etc.)
+- Bandeau d'approbation temps reel via WebSocket
+- Rafraichissement automatique a l'ouverture de l'onglet
+
+### G. Memoire Episodique Narrative
+
+"Consolidation Nocturne" : l'agent relit ses echanges et redige un resume de chapitre.
+
+**Principe** : Apres une session longue (>= 5 echanges) ou une fois toutes les 6 heures, l'agent genere un resume narratif structure et l'ajoute a `PROJECT_MEMORY.md`.
+
+**Structure du resume** :
+1. Contexte - objectif de la session
+2. Actions cles - decisions et actions prises
+3. Resultats - ce qui a ete accompli
+4. Lecons apprises - erreurs commises et corrigees
+5. Pistes ouvertes - ce qui reste a faire
+
+**Injection contextuelle** : Au demarrage d'une nouvelle session, les 3 derniers chapitres sont injectes dans le contexte systeme pour que l'agent se "souvienne" de ses sessions precedentes.
+
+**Configuration** :
+```yaml
+memory:
+  episodic:
+    enabled: true
+    file: "PROJECT_MEMORY.md"
+    min_exchanges: 5
+    min_interval_seconds: 21600  # 6 heures
+    max_chapters_in_context: 3
+```
+
+### H. Mode Whisper (Approbation par Lots + Confiance Temporaire)
+
+Amelioration UX de l'approbation Human-in-the-Loop.
+
+**Approbation par lots** : Quand plusieurs operations sont en attente, un bouton "Tout autoriser" permet de toutes les approuver en un clic.
+
+**Confiance temporaire** : Apres approbation, un selecteur permet d'accorder une confiance temporaire (5/15/30/60 min) pour que le meme outil soit auto-approuve pendant la duree choisie.
+
+**Flux Whisper** :
+```
+3 operations en attente
+       |
+"Tout autoriser" + "Confiance 15 min"
+       |
+Auto-approbation pendant 15 min pour ces outils
+```
+
+**Configuration** :
+```yaml
+mcp:
+  approval:
+    trust_duration_minutes: 5   # Duree par defaut
+```
+
+**API** :
+
+| Endpoint                       | Methode | Description                  |
+|--------------------------------|---------|------------------------------|
+| `/api/approvals/batch`         | POST    | Approbation par lots         |
+| `/api/approvals/trusted`       | GET     | Outils avec confiance active |
+| `/api/approvals/trust`         | POST    | Accorder confiance temp.     |
+| `/api/approvals/trust`         | DELETE  | Revoquer confiance           |
+
+**WebSocket** : `{"type": "batch_approval", "approval_ids": [...], "approved": true, "trust_minutes": 15}`
+
+---
+
 ## Configuration
 
 Variables d'environnement supportees :
@@ -310,6 +404,10 @@ OPENCLAW_LOGGING__LEVEL=DEBUG    # Niveau de log
 | `/api/approvals/pending`          | GET     | Approbations en attente        |
 | `/api/approvals/{id}`             | POST    | Approuver/refuser              |
 | `/api/approvals/history`          | GET     | Historique approbations        |
+| `/api/approvals/batch`            | POST    | Approbation par lots (Whisper) |
+| `/api/approvals/trusted`          | GET     | Outils avec confiance temp.    |
+| `/api/approvals/trust`            | POST    | Accorder confiance temporaire  |
+| `/api/approvals/trust`            | DELETE  | Revoquer confiance             |
 | `/ws/{client_id}`                 | WS      | WebSocket temps reel           |
 
 ## Licence
