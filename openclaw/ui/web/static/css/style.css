@@ -972,6 +972,38 @@ html, body {
     50% { opacity: 0.6; }
 }
 
+/* Trace Replay */
+.btn-replay,
+.btn-replay-trace {
+    background: transparent;
+    border: 1px solid var(--error, #e06c75);
+    color: var(--error, #e06c75);
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    margin-left: 8px;
+    transition: all 0.2s;
+}
+
+.btn-replay:hover,
+.btn-replay-trace:hover {
+    background: var(--error, #e06c75);
+    color: var(--bg-primary, #1e1e2e);
+}
+
+.trace-replay-bar {
+    padding: 8px 12px;
+    text-align: center;
+    border-top: 1px solid var(--border, #3e4451);
+    margin-top: 8px;
+}
+
+.btn-replay-trace {
+    padding: 6px 16px;
+    font-size: 0.85rem;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
     #sidebar {

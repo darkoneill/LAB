@@ -117,6 +117,11 @@
         .map(([k, v]) => `<span class="span-attr">${escapeHtml(k)}: ${escapeHtml(String(v).substring(0, 80))}</span>`)
         .join('');
 
+      // Replay button for failed spans
+      const replayBtn = span.status === 'error'
+        ? `<button class="btn-replay" data-trace-id="${trace.trace_id}" data-span-id="${span.span_id}" title="Reprendre depuis cette etape">&#8634; Replay</button>`
+        : '';
+
       return `
         <div class="span-node ${sClass} ${indent}">
           <div class="span-header">
@@ -125,6 +130,7 @@
             <span class="span-name">${escapeHtml(span.name || '')}</span>
             <span class="span-duration">${duration}</span>
             <span class="span-status-dot ${sClass}"></span>
+            ${replayBtn}
           </div>
           ${attrs ? `<div class="span-attrs">${attrs}</div>` : ''}
           ${span.events && span.events.length ? renderEvents(span.events) : ''}
@@ -137,7 +143,26 @@
          </div>`
       : '';
 
-    container.innerHTML = header + '<div class="span-tree">' + spans + '</div>' + response;
+    // Trace-level replay button for error traces
+    const traceReplay = trace.status === 'error'
+      ? `<div class="trace-replay-bar">
+           <button class="btn-replay-trace" data-trace-id="${trace.trace_id}">&#8634; Reprendre depuis l'echec</button>
+         </div>`
+      : '';
+
+    container.innerHTML = header + '<div class="span-tree">' + spans + '</div>' + response + traceReplay;
+
+    // Wire up replay buttons
+    container.querySelectorAll('.btn-replay').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        replayFromSpan(btn.dataset.traceId, btn.dataset.spanId);
+      });
+    });
+    container.querySelectorAll('.btn-replay-trace').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        replayFromSpan(btn.dataset.traceId, null);
+      });
+    });
   }
 
   function renderEvents(events) {
@@ -374,9 +399,63 @@
           clearThoughts();
         } else if (data.type === 'agent_spawned' || data.type === 'agent_completed' || data.type === 'agent_failed') {
           updateSwarmAgent(data);
+        } else if (data.type === 'scheduled_task_started' || data.type === 'scheduled_task_completed') {
+          showScheduledTaskNotification(data);
+        } else if (data.type === 'trace_replayed') {
+          appendThought({
+            text: '[REPLAY] Trace ' + data.trace_id + ' rejouee.',
+            new_turn: true,
+            agent: 'system',
+          });
         }
       } catch (e) { /* ignore non-JSON */ }
     };
+  }
+
+  // ── Trace Replay ────────────────────────────────────────────
+  async function replayFromSpan(traceId, spanId) {
+    var body = {};
+    if (spanId) body.from_span_id = spanId;
+
+    try {
+      var res = await fetch(API + '/api/traces/' + traceId + '/replay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      var data = await res.json();
+      if (data.success) {
+        appendThought({
+          text: '[REPLAY] Trace ' + traceId + ' relancee avec succes.',
+          new_turn: true,
+          agent: 'system',
+        });
+        // Refresh the trace detail
+        loadTraceDetail(traceId);
+      } else {
+        appendThought({
+          text: '[REPLAY] Echec: ' + (data.error || 'erreur inconnue'),
+          new_turn: true,
+          agent: 'system',
+        });
+      }
+    } catch (e) {
+      console.error('Replay failed:', e);
+      appendThought({
+        text: '[REPLAY] Erreur reseau: ' + e.message,
+        new_turn: true,
+        agent: 'system',
+      });
+    }
+  }
+
+  // ── Scheduled Task notifications ──────────────────────────────
+  function showScheduledTaskNotification(data) {
+    var task = data.task || {};
+    var text = data.type === 'scheduled_task_started'
+      ? '[CRON] Tache planifiee demarree: ' + (task.description || '').substring(0, 80)
+      : '[CRON] Tache terminee (' + task.status + '): ' + (task.description || '').substring(0, 80);
+    appendThought({ text: text, new_turn: true, agent: 'scheduler' });
   }
 
   // ── Helpers ───────────────────────────────────────────────────
