@@ -33,6 +33,7 @@ services:
       - openclaw_config:/data/config
       - openclaw_logs:/data/logs
       - openclaw_skills:/data/skills
+      - openclaw_traces:/data/traces
       - sandbox_tmp:/tmp/openclaw-sandbox
       - /var/run/docker.sock:/var/run/docker.sock  # For sandbox container management
 
@@ -192,6 +193,8 @@ volumes:
   openclaw_logs:
     driver: local
   openclaw_skills:
+    driver: local
+  openclaw_traces:
     driver: local
   nginx_cache:
     driver: local

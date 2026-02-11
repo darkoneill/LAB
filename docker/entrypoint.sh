@@ -28,6 +28,7 @@ echo -e "${GREEN}[init]${NC} Verification des repertoires..."
 mkdir -p "${DATA_DIR}/memory" \
          "${DATA_DIR}/config" \
          "${DATA_DIR}/logs" \
+         "${DATA_DIR}/traces" \
          "${DATA_DIR}/skills"
 
 # ── Copier la config par defaut si absente ────────────────────
@@ -66,6 +67,23 @@ providers:
 memory:
   enabled: true
   store_path: "${DATA_DIR}/memory"
+
+tracing:
+  enabled: true
+  store_path: "${DATA_DIR}/traces"
+
+sandbox:
+  enabled: true
+  workspace_path: "/workspace"
+  self_healing:
+    enabled: true
+    max_attempts: 3
+
+agent:
+  swarm:
+    enabled: true
+    max_iterations: 3
+    dry_run: true
 
 logging:
   level: "${OPENCLAW_LOGGING__LEVEL:-INFO}"

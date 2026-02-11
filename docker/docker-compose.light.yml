@@ -3,16 +3,16 @@
 # Version allegee sans nginx/certbot (acces direct au port)
 # Ideal pour : test local, VPS derriere un proxy existant
 #
-# Usage:
+# Usage (depuis la racine du projet):
 #   cp .env.example .env
-#   docker compose -f docker-compose.light.yml up -d
+#   docker compose -f docker/docker-compose.light.yml up -d
 # ============================================================
 
 services:
 
   app:
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile
     container_name: openclaw
     restart: unless-stopped
@@ -30,6 +30,7 @@ services:
       - openclaw_memory:/data/memory
       - openclaw_config:/data/config
       - openclaw_logs:/data/logs
+      - openclaw_traces:/data/traces
       - openclaw_skills:/data/skills
 
     ports:
@@ -58,4 +59,5 @@ volumes:
   openclaw_memory:
   openclaw_config:
   openclaw_logs:
+  openclaw_traces:
   openclaw_skills:
