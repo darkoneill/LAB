@@ -33,6 +33,7 @@ services:
       - openclaw_config:/data/config
       - openclaw_logs:/data/logs
       - openclaw_skills:/data/skills
+      - openclaw_traces:/data/traces
       - sandbox_tmp:/tmp/openclaw-sandbox
       - /var/run/docker.sock:/var/run/docker.sock  # For sandbox container management
 
@@ -65,7 +66,9 @@ services:
 
   # ── Nginx Reverse Proxy ──────────────────────────────────────
   nginx:
-    image: nginx:alpine
+    build:
+      context: ./docker/nginx
+      dockerfile: Dockerfile
     container_name: openclaw-nginx
     restart: unless-stopped
     depends_on:
@@ -73,8 +76,6 @@ services:
         condition: service_healthy
 
     volumes:
-      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
       - nginx_cache:/var/cache/nginx
       - certbot_www:/var/www/certbot:ro
       - certbot_certs:/etc/letsencrypt:ro
@@ -192,6 +193,8 @@ volumes:
   openclaw_logs:
     driver: local
   openclaw_skills:
+    driver: local
+  openclaw_traces:
     driver: local
   nginx_cache:
     driver: local

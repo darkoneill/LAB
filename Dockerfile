@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /install /usr/local
 
 # Creer les repertoires de l'application
-RUN mkdir -p /app /data/memory /data/config /data/logs /data/skills \
+RUN mkdir -p /app /data/memory /data/config /data/logs /data/traces /data/skills \
     && chown -R openclaw:openclaw /app /data
 
 WORKDIR /app
@@ -54,7 +54,7 @@ COPY --chown=openclaw:openclaw docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Volumes pour la persistance
-VOLUME ["/data/memory", "/data/config", "/data/logs", "/data/skills"]
+VOLUME ["/data/memory", "/data/config", "/data/logs", "/data/traces", "/data/skills"]
 
 # Ports : Gateway API + Web UI
 EXPOSE 18789
@@ -69,6 +69,8 @@ ENV PYTHONUNBUFFERED=1 \
     OPENCLAW_LOGGING__LEVEL=INFO \
     OPENCLAW_LOGGING__FILE=/data/logs/openclaw.log \
     OPENCLAW_MEMORY__STORE_PATH=/data/memory \
+    OPENCLAW_TRACING__STORE_PATH=/data/traces \
+    OPENCLAW_SANDBOX__WORKSPACE_PATH=/workspace \
     OPENCLAW_UI__WEB__ENABLED=true \
     TZ=Europe/Paris
 
