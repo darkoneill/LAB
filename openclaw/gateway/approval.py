@@ -194,10 +194,10 @@ class ApprovalMiddleware:
             logger.debug(f"Tool '{tool_name}' auto-approved (safe)")
             return True, "auto_approved_safe"
 
-        # Check temporary trust (Whisper Mode)
-        trust_key = self._trust_key(tool_name, server_name)
-        if self._is_trusted(trust_key):
-            logger.debug(f"Tool '{tool_name}' auto-approved (temporary trust)")
+        # Check temporary trust (Whisper Mode) with path scoping
+        resource_path = self._extract_resource_path(arguments)
+        if self._is_trusted(tool_name, server_name, resource_path):
+            logger.debug(f"Tool '{tool_name}' auto-approved (temporary trust, path={resource_path or '*'})")
             return True, "trusted"
 
         # Sensitive/Critical tools need approval
@@ -350,27 +350,72 @@ class ApprovalMiddleware:
 
     # ── Temporary Trust (Whisper Mode) ───────────────────────────────
 
-    @staticmethod
-    def _trust_key(tool_name: str, server_name: str) -> str:
-        """Generate a trust key for a tool+server combination."""
-        return f"{server_name}::{tool_name}" if server_name else tool_name
+    # ── Resource path extraction ─────────────────────────────────
 
-    def _is_trusted(self, trust_key: str) -> bool:
-        """Check if a tool is temporarily trusted and not expired."""
-        expiry = self._trusted.get(trust_key)
-        if expiry is None:
-            return False
-        if time.time() > expiry:
-            # Expired - clean up
-            self._trusted.pop(trust_key, None)
-            return False
-        return True
+    _PATH_ARG_KEYS = ("path", "file_path", "repo", "repository", "channel", "directory")
+
+    @staticmethod
+    def _extract_resource_path(arguments: dict) -> str:
+        """Extract the primary resource path from tool arguments."""
+        for key in ApprovalMiddleware._PATH_ARG_KEYS:
+            val = arguments.get(key, "")
+            if val:
+                return str(val)
+        return ""
+
+    @staticmethod
+    def _trust_key(tool_name: str, server_name: str, resource_path: str = "") -> str:
+        """Generate a trust key for a tool+server+path combination."""
+        base = f"{server_name}::{tool_name}" if server_name else tool_name
+        if resource_path:
+            return f"{base}@{resource_path}"
+        return base
+
+    def _is_trusted(self, tool_name: str, server_name: str, resource_path: str = "") -> bool:
+        """
+        Check if a tool is temporarily trusted and not expired.
+
+        Trust resolution order (most specific wins):
+        1. Exact path trust:  server::tool@/workspace/project/
+        2. Tool-level trust:  server::tool  (no path restriction)
+        """
+        now = time.time()
+
+        # Check exact path trust first (most specific)
+        if resource_path:
+            exact_key = self._trust_key(tool_name, server_name, resource_path)
+            expiry = self._trusted.get(exact_key)
+            if expiry is not None:
+                if now <= expiry:
+                    return True
+                self._trusted.pop(exact_key, None)
+
+            # Check prefix-based path trust (trust /workspace/ covers /workspace/foo)
+            base_key_prefix = self._trust_key(tool_name, server_name, "")
+            for key, expiry in list(self._trusted.items()):
+                if key.startswith(base_key_prefix + "@") and now <= expiry:
+                    trusted_path = key.split("@", 1)[1]
+                    if resource_path.startswith(trusted_path):
+                        return True
+                elif key.startswith(base_key_prefix + "@") and now > expiry:
+                    self._trusted.pop(key, None)
+
+        # Check tool-level trust (no path restriction)
+        tool_key = self._trust_key(tool_name, server_name)
+        expiry = self._trusted.get(tool_key)
+        if expiry is not None:
+            if now <= expiry:
+                return True
+            self._trusted.pop(tool_key, None)
+
+        return False
 
     def grant_trust(
         self,
         tool_name: str,
         server_name: str = "",
         duration_minutes: int = 0,
+        resource_path: str = "",
     ) -> float:
         """
         Grant temporary trust to a tool for N minutes.
@@ -379,6 +424,7 @@ class ApprovalMiddleware:
             tool_name: The tool name (or "*" for all tools on a server).
             server_name: The MCP server name.
             duration_minutes: Trust duration in minutes (0 = use config default).
+            resource_path: If set, trust is restricted to this path prefix only.
 
         Returns:
             The trust expiry timestamp.
@@ -388,15 +434,16 @@ class ApprovalMiddleware:
             minutes = 5  # Default 5 minutes if nothing configured
 
         expiry = time.time() + (minutes * 60)
-        trust_key = self._trust_key(tool_name, server_name)
+        trust_key = self._trust_key(tool_name, server_name, resource_path)
         self._trusted[trust_key] = expiry
 
+        scope = f" (path={resource_path})" if resource_path else " (global)"
         logger.info(
-            f"Trust granted: {trust_key} for {minutes}min (expires {expiry})"
+            f"Trust granted: {trust_key} for {minutes}min{scope} (expires {expiry})"
         )
         return expiry
 
-    def revoke_trust(self, tool_name: str = "", server_name: str = ""):
+    def revoke_trust(self, tool_name: str = "", server_name: str = "", resource_path: str = ""):
         """Revoke temporary trust. If no args, revokes all trust."""
         if not tool_name and not server_name:
             count = len(self._trusted)
@@ -404,7 +451,7 @@ class ApprovalMiddleware:
             logger.info(f"All temporary trust revoked ({count} entries)")
             return count
 
-        trust_key = self._trust_key(tool_name, server_name)
+        trust_key = self._trust_key(tool_name, server_name, resource_path)
         removed = self._trusted.pop(trust_key, None)
         if removed:
             logger.info(f"Trust revoked: {trust_key}")

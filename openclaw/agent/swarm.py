@@ -33,6 +33,7 @@ class AgentRole(str, Enum):
     RESEARCHER = "researcher"
     PLANNER = "planner"
     TESTER = "tester"
+    SECURITY = "security"
 
 
 # ── Agent Profile Definitions ────────────────────────────────────────
@@ -63,7 +64,11 @@ AGENT_PROFILES: dict[str, dict] = {
             "4. Non-respect des bonnes pratiques "
             "Tu as acces en LECTURE SEULE au sandbox. "
             "Reponds avec une liste structuree de problemes trouves, "
-            "classes par severite (CRITIQUE / MAJEUR / MINEUR)."
+            "classes par severite (CRITIQUE / MAJEUR / MINEUR). "
+            "Si un probleme necessite un specialiste, ajoute une ligne: "
+            "ROUTE:security pour les failles de securite, "
+            "ROUTE:tester pour les cas limites non testes. "
+            "Si le code est acceptable, reponds exactement: APPROVED"
         ),
         "temperature": 0.2,
         "max_tokens": 2048,
@@ -127,6 +132,32 @@ AGENT_PROFILES: dict[str, dict] = {
         "sandbox_access": "read_write",
         "tools": ["python", "shell"],
     },
+    AgentRole.SECURITY: {
+        "name": "Security Agent",
+        "system_prompt": (
+            "Tu es un expert en securite applicative (OWASP Top 10, SANS). "
+            "Tu analyses le code pour detecter : "
+            "1. Injections (SQL, commande, LDAP, XSS, SSTI) "
+            "2. Fuites de secrets (cles API, tokens dans le code) "
+            "3. SSRF et acces reseau non controle "
+            "4. Deserialisation non securisee "
+            "5. Controle d'acces insuffisant "
+            "Reponds avec un rapport structure: "
+            "[VULN-ID] Severite | Description | Ligne(s) | Remediation proposee. "
+            "Si aucune faille, reponds exactement: SECURE"
+        ),
+        "temperature": 0.1,
+        "max_tokens": 2048,
+        "sandbox_access": "read_only",
+        "tools": ["shell"],
+    },
+}
+
+# Mapping for ROUTE: directives from Reviewer
+ROUTE_MAPPING: dict[str, str] = {
+    "security": AgentRole.SECURITY,
+    "tester": AgentRole.TESTER,
+    "researcher": AgentRole.RESEARCHER,
 }
 
 
@@ -276,8 +307,31 @@ class SwarmOrchestrator:
                     logger.info(f"Swarm: Code APPROVED at iteration {iteration}")
                     break
 
+                # Dynamic routing: delegate to specialists if reviewer requests it
+                routed_roles = self._parse_routing(review_feedback)
+                for routed_role in routed_roles:
+                    if routed_role not in swarm_result.agents_used:
+                        swarm_result.agents_used.append(routed_role)
+
+                    specialist_task = (
+                        f"Le Reviewer a identifie des problemes dans ce code "
+                        f"qui necessitent ton expertise.\n\n"
+                        f"Code:\n```python\n{current_code}\n```\n\n"
+                        f"Feedback du Reviewer:\n{review_feedback}\n\n"
+                        f"Analyse et fournis un rapport detaille."
+                    )
+                    specialist_output = await self._run_agent(routed_role, specialist_task)
+                    trace.append({
+                        "phase": f"routed_{routed_role}",
+                        "iteration": iteration,
+                        "output": specialist_output[:1000],
+                    })
+                    # Enrich review feedback with specialist findings
+                    review_feedback += f"\n\n[{routed_role.upper()} REPORT]\n{specialist_output}"
+
                 logger.info(
                     f"Swarm: Review iteration {iteration} - corrections needed"
+                    + (f" (routed to: {routed_roles})" if routed_roles else "")
                 )
 
             # Tester phase (optional)
@@ -337,6 +391,19 @@ class SwarmOrchestrator:
             f"agents={swarm_result.agents_used}, validated={swarm_result.validated}"
         )
         return swarm_result
+
+    @staticmethod
+    def _parse_routing(review_output: str) -> list[str]:
+        """Parse ROUTE: directives from reviewer output and return agent roles."""
+        routed = []
+        for line in review_output.splitlines():
+            line_stripped = line.strip().upper()
+            if line_stripped.startswith("ROUTE:"):
+                target = line_stripped.split(":", 1)[1].strip().lower()
+                mapped_role = ROUTE_MAPPING.get(target)
+                if mapped_role and mapped_role not in routed:
+                    routed.append(mapped_role)
+        return routed
 
     async def _run_agent(self, role: str, task: str) -> str:
         """Run a single specialized agent with its profile."""
