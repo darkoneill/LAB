@@ -291,6 +291,96 @@ class TraceRecorder:
             "max_traces_capacity": self._max_traces,
         }
 
+    def get_replay_context(self, trace_id: str, from_span_id: str = None) -> Optional[dict]:
+        """
+        Build a replay context from a trace, optionally starting from a specific span.
+
+        Returns a dict with the information needed to re-launch the agent
+        from the point of failure:
+        - user_input: the original user request
+        - session_id: the original session
+        - completed_spans: spans that succeeded (before the failure)
+        - failed_span: the span that failed (if from_span_id given)
+        - replay_messages: reconstructed conversation messages for LLM context
+
+        Returns None if trace not found.
+        """
+        trace_data = self.get_trace(trace_id)
+        if not trace_data:
+            return None
+
+        spans = trace_data.get("spans", [])
+        user_input = trace_data.get("user_input", "")
+        session_id = trace_data.get("session_id", "")
+
+        # Split spans into completed and failed
+        completed = []
+        failed_span = None
+        replay_from_idx = 0
+
+        if from_span_id:
+            for i, span in enumerate(spans):
+                if span.get("span_id") == from_span_id:
+                    failed_span = span
+                    replay_from_idx = i
+                    break
+                completed.append(span)
+        else:
+            # Find first error span
+            for i, span in enumerate(spans):
+                if span.get("status") == "error":
+                    failed_span = span
+                    replay_from_idx = i
+                    break
+                completed.append(span)
+
+        # Reconstruct context messages from completed spans
+        replay_messages = [{"role": "user", "content": user_input}]
+
+        # Add context from completed spans as assistant knowledge
+        context_parts = []
+        for span in completed:
+            kind = span.get("kind", "")
+            name = span.get("name", "")
+            attrs = span.get("attributes", {})
+            if kind == "llm_call" and attrs.get("response"):
+                context_parts.append(
+                    f"[{kind}:{name}] {str(attrs['response'])[:500]}"
+                )
+            elif kind == "tool_exec" and attrs.get("output"):
+                context_parts.append(
+                    f"[{kind}:{name}] {str(attrs['output'])[:500]}"
+                )
+
+        if context_parts:
+            replay_messages.append({
+                "role": "assistant",
+                "content": "\n".join(context_parts),
+            })
+
+        # Add failure info for the LLM to fix
+        if failed_span:
+            error_info = failed_span.get("attributes", {}).get("error", "")
+            replay_messages.append({
+                "role": "user",
+                "content": (
+                    f"L'etape precedente a echoue.\n"
+                    f"Etape: {failed_span.get('kind', '')} - {failed_span.get('name', '')}\n"
+                    f"Erreur: {error_info}\n\n"
+                    f"Reprends a partir de cette etape et corrige le probleme."
+                ),
+            })
+
+        return {
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "user_input": user_input,
+            "completed_spans": completed,
+            "failed_span": failed_span,
+            "replay_from_index": replay_from_idx,
+            "replay_messages": replay_messages,
+        }
+
     def search_traces(self, query: str, limit: int = 20) -> list[dict]:
         """Search traces by user input content."""
         query_lower = query.lower()

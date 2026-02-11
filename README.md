@@ -479,6 +479,63 @@ Representation graphique de l'essaim d'agents dans Mission Control.
 
 ---
 
+## Sublimation V - Autonomie et Echelle (V8)
+
+### Q. Repository Map (Conscience du Code)
+
+Generation automatique d'une carte squelettique du projet via le module `ast` de Python.
+
+**Principe** : Avant chaque cycle swarm, le systeme scanne l'arborescence du workspace et extrait les noms de classes, signatures de fonctions et constantes top-level. Cette carte comprimee (max 4000 chars) est injectee dans les prompts du Planner et du Coder (premiere iteration).
+
+**Module** : `openclaw/tools/repo_map.py`
+- `generate_repo_map(root, max_chars)` : parcourt les fichiers `.py`, parse via `ast`, retourne un squelette compact
+- Exclusion automatique de `__pycache__`, `.git`, `venv`, `node_modules`, etc.
+- Budget-guard : troncature automatique si le squelette depasse `max_chars`
+
+### R. Dry Run (Tests Preemptifs)
+
+Verification de syntaxe via `py_compile` avant la phase Review dans le swarm.
+
+**Principe** : Apres que le Coder produit du code, un `py_compile.compile()` est execute en local (sans sandbox). Si une erreur de syntaxe est detectee, le rapport est injecte dans le prompt du Reviewer avec le tag `[RESULTAT DRY RUN]`.
+
+**Avantage** : Le Reviewer ne perd pas de tokens a analyser du code syntaxiquement invalide. Les erreurs triviales sont attrapees immediatement.
+
+**Config** : `agent.swarm.dry_run: true` (actif par defaut)
+
+### S. Chronotaches (Agentic Cron)
+
+Planification autonome de taches futures par l'agent.
+
+**Principe** : L'agent peut appeler `schedule_task(description, delay_minutes)` pour programmer une tache qui sera executee automatiquement apres le delai. Un loop asyncio en arriere-plan surveille les taches dues toutes les 5 secondes.
+
+**Module** : `openclaw/agent/scheduler.py`
+- `TaskScheduler.schedule(description, delay_minutes, session_id)` : programme une tache
+- `TaskScheduler.cancel(task_id)` : annule une tache en attente
+- `TaskScheduler.list_tasks()` : liste les taches planifiees
+
+**API** :
+- `POST /api/scheduler/tasks` : programmer une tache
+- `GET /api/scheduler/tasks` : lister les taches
+- `DELETE /api/scheduler/tasks/{id}` : annuler
+
+**WebSocket** : `scheduled_task_started`, `scheduled_task_completed` avec notification dans le Terminal de Pensee.
+
+**Garde-fou** : Maximum 20 taches en attente simultanement. Delai minimum 6 secondes.
+
+### T. Trace Replay (Reprendre depuis l'echec)
+
+Reprise d'execution depuis un span echoue dans Mission Control.
+
+**Principe** : Le `TraceRecorder` expose `get_replay_context(trace_id, from_span_id)` qui reconstruit le contexte conversationnel (messages, resultats partiels) jusqu'au point d'echec. L'agent est relance avec ce contexte enrichi + description de l'erreur.
+
+**UI** : Bouton `Replay` rouge sur chaque span en erreur dans l'arbre de decision. Bouton `Reprendre depuis l'echec` en bas des traces en erreur.
+
+**API** : `POST /api/traces/{id}/replay` avec `from_span_id` optionnel.
+
+**WebSocket** : `trace_replayed` pour notification.
+
+---
+
 ## Configuration
 
 Variables d'environnement supportees :
@@ -531,6 +588,10 @@ OPENCLAW_LOGGING__LEVEL=DEBUG    # Niveau de log
 | `/api/approvals/trusted`          | GET     | Outils avec confiance temp.    |
 | `/api/approvals/trust`            | POST    | Accorder confiance temporaire  |
 | `/api/approvals/trust`            | DELETE  | Revoquer confiance (query params) |
+| `/api/traces/{id}/replay`        | POST    | Relancer depuis un echec (Replay) |
+| `/api/scheduler/tasks`            | POST    | Programmer une chronotache     |
+| `/api/scheduler/tasks`            | GET     | Lister les taches planifiees   |
+| `/api/scheduler/tasks/{id}`       | DELETE  | Annuler une chronotache        |
 | `/ws/{client_id}`                 | WS      | WebSocket temps reel           |
 
 ## Licence

@@ -178,6 +178,9 @@ class GatewayServer:
         self.rate_limiter = RateLimiter()
         self.tracer = get_tracer()
         self.approval = ApprovalMiddleware(ws_manager=self.ws_manager)
+        # Chronotaches: background task scheduler
+        from openclaw.agent.scheduler import TaskScheduler
+        self.scheduler = TaskScheduler(brain=agent_brain, ws_manager=self.ws_manager)
         self.start_time = time.time()
         self._setup_middleware()
         self._setup_routes()
@@ -412,6 +415,47 @@ class GatewayServer:
                 raise HTTPException(404, "Trace not found")
             return trace
 
+        @self.app.post("/api/traces/{trace_id}/replay")
+        async def replay_trace(trace_id: str, request: Request):
+            """Trace Replay: resume agent execution from a failed span."""
+            body = await request.json()
+            from_span_id = body.get("from_span_id", None)
+
+            ctx = self.tracer.get_replay_context(trace_id, from_span_id)
+            if not ctx:
+                raise HTTPException(404, "Trace not found")
+
+            if not self.agent:
+                raise HTTPException(503, "Agent brain not initialized")
+
+            # Re-launch agent with reconstructed context
+            result = await self.agent.generate(
+                messages=ctx["replay_messages"],
+                max_tokens=4096,
+            )
+
+            # Store result in session
+            session = self.sessions.get_or_create(ctx["session_id"] or None)
+            self.sessions.add_message(
+                session["id"], "assistant", result.get("content", ""),
+                metadata={"replayed_from": trace_id},
+            )
+
+            # Notify via WS
+            await self.ws_manager.broadcast({
+                "type": "trace_replayed",
+                "trace_id": trace_id,
+                "session_id": session["id"],
+                "content_preview": result.get("content", "")[:200],
+            })
+
+            return {
+                "success": True,
+                "trace_id": trace_id,
+                "session_id": session["id"],
+                "content": result.get("content", ""),
+            }
+
         # ── Swarm API ───────────────────────────────────
         @self.app.get("/api/swarm/profiles")
         async def swarm_profiles():
@@ -508,6 +552,36 @@ class GatewayServer:
             """Revoke temporary trust (use query params, not body)."""
             count = self.approval.revoke_trust(tool_name, server_name)
             return {"revoked": count}
+
+        # ── Chronotaches (Agentic Cron) API ──────────────
+        @self.app.post("/api/scheduler/tasks")
+        async def schedule_task(request: Request):
+            """Schedule a task for future autonomous execution."""
+            body = await request.json()
+            description = body.get("description", "")
+            delay_minutes = body.get("delay_minutes", 1)
+            session_id = body.get("session_id", "")
+            if not description:
+                raise HTTPException(400, "description is required")
+            try:
+                task_id = self.scheduler.schedule(
+                    description=description,
+                    delay_minutes=delay_minutes,
+                    session_id=session_id,
+                )
+                return {"task_id": task_id, "fire_in_minutes": delay_minutes}
+            except ValueError as e:
+                raise HTTPException(429, str(e))
+
+        @self.app.get("/api/scheduler/tasks")
+        async def list_scheduled_tasks(include_done: bool = False):
+            return {"tasks": self.scheduler.list_tasks(include_done)}
+
+        @self.app.delete("/api/scheduler/tasks/{task_id}")
+        async def cancel_scheduled_task(task_id: str):
+            if self.scheduler.cancel(task_id):
+                return {"cancelled": True}
+            raise HTTPException(404, "Task not found or not cancellable")
 
         # ── WebSocket ────────────────────────────────────
         @self.app.websocket("/ws/{client_id}")
@@ -732,6 +806,8 @@ class GatewayServer:
 
         # Start background cleanup task
         cleanup_task = asyncio.create_task(self._session_cleanup_loop())
+        # Start Chronotaches scheduler
+        await self.scheduler.start()
 
         config = uvicorn.Config(
             self.app,
@@ -744,6 +820,7 @@ class GatewayServer:
         try:
             await server.serve()
         finally:
+            await self.scheduler.stop()
             cleanup_task.cancel()
             try:
                 await cleanup_task

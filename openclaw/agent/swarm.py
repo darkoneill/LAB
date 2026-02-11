@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Optional, TYPE_CHECKING
 
 from openclaw.config.settings import get_settings
+from openclaw.tools.repo_map import generate_repo_map
 
 if TYPE_CHECKING:
     from openclaw.agent.brain import AgentBrain
@@ -214,6 +215,8 @@ class SwarmOrchestrator:
         self._active_agents: dict[str, SwarmAgent] = {}
         # Human hint injection buffer (set via inject_hint)
         self._pending_hint: str = ""
+        # Dry Run: compile-check code before passing to Reviewer
+        self._dry_run_enabled = self.settings.get("agent.swarm.dry_run", True)
 
     async def execute_swarm(
         self,
@@ -249,9 +252,25 @@ class SwarmOrchestrator:
 
         logger.info(f"Swarm started: roles={roles}, task='{task[:80]}...'")
 
+        # Phase 0: Generate Repository Map for context awareness
+        repo_map = ""
+        workspace = self.settings.get("sandbox.workspace_path", "/workspace")
+        try:
+            repo_map = generate_repo_map(workspace, max_chars=4000)
+            if repo_map and len(repo_map) > 50:
+                trace.append({"phase": "repo_map", "chars": len(repo_map)})
+                logger.info(f"repo_map generated: {len(repo_map)} chars")
+        except Exception as e:
+            logger.debug(f"repo_map generation skipped: {e}")
+
         # Phase 1: Planning (if planner is included)
         if AgentRole.PLANNER in roles:
-            plan = await self._run_agent(AgentRole.PLANNER, task)
+            planner_input = task
+            if repo_map:
+                planner_input = (
+                    f"[CARTE DU PROJET]\n{repo_map}\n[/CARTE]\n\n{task}"
+                )
+            plan = await self._run_agent(AgentRole.PLANNER, planner_input)
             trace.append({"phase": "planning", "output": plan})
             swarm_result.agents_used.append(AgentRole.PLANNER)
             # Enrich task with plan
@@ -301,7 +320,11 @@ class SwarmOrchestrator:
                         f"Corrige le code en tenant compte de TOUS les points souleves."
                     )
                 else:
-                    coder_task = task + hint_block
+                    # First iteration: inject repo map for context awareness
+                    map_block = ""
+                    if repo_map and iteration == 1:
+                        map_block = f"\n\n[CARTE DU PROJET]\n{repo_map}\n[/CARTE]"
+                    coder_task = task + map_block + hint_block
 
                 current_code = await self._run_agent(AgentRole.CODER, coder_task)
                 swarm_result.code = current_code
@@ -314,12 +337,31 @@ class SwarmOrchestrator:
                     "output": current_code[:1000],
                 })
 
+            # Dry Run phase: py_compile before review
+            dry_run_report = ""
+            if current_code and self._dry_run_enabled:
+                dry_run_report = await self._dry_run_compile(current_code)
+                if dry_run_report:
+                    trace.append({
+                        "phase": "dry_run",
+                        "iteration": iteration,
+                        "output": dry_run_report[:500],
+                    })
+                    logger.info(f"Dry run: {dry_run_report[:120]}")
+
             # Reviewer phase
             if AgentRole.REVIEWER in roles and current_code:
+                dry_run_block = ""
+                if dry_run_report:
+                    dry_run_block = (
+                        f"\n\n[RESULTAT DRY RUN (py_compile)]\n"
+                        f"{dry_run_report}\n[/DRY RUN]\n"
+                    )
                 review_task = (
                     f"Analyse ce code Python pour la tache suivante:\n"
                     f"Tache: {task[:500]}\n\n"
-                    f"Code a analyser:\n```python\n{current_code}\n```\n\n"
+                    f"Code a analyser:\n```python\n{current_code}\n```"
+                    f"{dry_run_block}\n\n"
                     f"Liste tous les problemes trouves. "
                     f"Si le code est acceptable, reponds exactement: APPROVED"
                 )
@@ -457,6 +499,42 @@ class SwarmOrchestrator:
 
         # Fallback: hard-truncate to keep the tail (most recent issues)
         return feedback[-self._FEEDBACK_COMPRESS_THRESHOLD:]
+
+    async def _dry_run_compile(self, code: str) -> str:
+        """
+        Dry Run: attempt py_compile on the code to catch syntax errors early.
+
+        Returns an empty string if compilation succeeds, or a diagnostic
+        string describing the error(s) found.
+        """
+        import tempfile
+        import py_compile
+        import os
+
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix="dryrun_")
+            os.close(fd)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(code)
+
+            py_compile.compile(tmp_path, doraise=True)
+            return ""  # Success: no errors
+        except py_compile.PyCompileError as e:
+            # Extract the meaningful part of the error
+            msg = str(e)
+            # Try to rewrite temp path to something readable
+            if tmp_path:
+                msg = msg.replace(tmp_path, "<code>")
+            return f"ERREUR DE COMPILATION:\n{msg}"
+        except Exception as e:
+            return f"ERREUR DRY RUN: {e}"
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def inject_hint(self, hint: str):
         """Inject a human hint to be consumed by the next Coder iteration."""
