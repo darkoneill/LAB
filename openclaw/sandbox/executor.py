@@ -430,6 +430,68 @@ class SandboxExecutor:
                     "sandboxed": True,
                 }
 
+            elif tool_name == "patch_file":
+                # Graceful patching: apply search/replace edits without rewriting whole file
+                path = args.get("path", "")
+                edits = args.get("edits", [])  # [{"search": "...", "replace": "..."}]
+                sandbox_path = f"/workspace/{path.lstrip('/')}"
+
+                if not edits:
+                    return {"success": False, "error": "No edits provided", "sandboxed": True}
+
+                # Build a Python script that applies each search/replace in order
+                patch_script_lines = [
+                    "import sys",
+                    f"path = {sandbox_path!r}",
+                    "try:",
+                    "    with open(path, 'r') as f:",
+                    "        content = f.read()",
+                ]
+                for i, edit in enumerate(edits):
+                    search = edit.get("search", "")
+                    replace = edit.get("replace", "")
+                    if not search:
+                        continue
+                    patch_script_lines.append(
+                        f"    if {search!r} not in content:"
+                    )
+                    patch_script_lines.append(
+                        f"        print(f'PATCH_WARNING: edit {i} search not found', file=sys.stderr)"
+                    )
+                    patch_script_lines.append(
+                        f"    else:"
+                    )
+                    patch_script_lines.append(
+                        f"        content = content.replace({search!r}, {replace!r}, 1)"
+                    )
+                patch_script_lines += [
+                    "    with open(path, 'w') as f:",
+                    "        f.write(content)",
+                    "    print(f'Patched {path}: {len(content)} chars')",
+                    "except Exception as e:",
+                    "    print(str(e), file=sys.stderr)",
+                    "    sys.exit(1)",
+                ]
+                patch_script = "\n".join(patch_script_lines)
+
+                # Write patch script via base64 and execute
+                b64_script = base64.b64encode(patch_script.encode("utf-8")).decode("ascii")
+                patch_cmd = (
+                    f"echo '{b64_script}' | base64 -d > /workspace/_patch.py && "
+                    f"python3 /workspace/_patch.py"
+                )
+                result = await self.container_manager.execute_in_sandbox(
+                    container_id, patch_cmd
+                )
+                return {
+                    "success": result["success"],
+                    "output": result["stdout"],
+                    "error": result["stderr"] if not result["success"] else None,
+                    "path": sandbox_path,
+                    "edits_count": len(edits),
+                    "sandboxed": True,
+                }
+
             elif tool_name in ("write_file", "write"):
                 # Write file in sandbox (safe: base64-encode to avoid injection)
                 path = args.get("path", "")

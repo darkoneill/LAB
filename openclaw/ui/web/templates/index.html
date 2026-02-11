@@ -88,6 +88,18 @@
                     </div>
                 </div>
 
+                <!-- Swarm Room -->
+                <div class="swarm-room" id="swarm-room">
+                    <span class="swarm-room-label">Essaim</span>
+                    <div class="swarm-agent-dot" data-role="planner"><span class="agent-pip"></span>Plan</div>
+                    <div class="swarm-agent-dot" data-role="coder"><span class="agent-pip"></span>Code</div>
+                    <div class="swarm-agent-dot" data-role="reviewer"><span class="agent-pip"></span>Review</div>
+                    <div class="swarm-agent-dot" data-role="security"><span class="agent-pip"></span>Secu</div>
+                    <div class="swarm-agent-dot" data-role="tester"><span class="agent-pip"></span>Test</div>
+                    <div class="swarm-agent-dot" data-role="critic"><span class="agent-pip"></span>Critic</div>
+                    <div class="swarm-agent-dot" data-role="researcher"><span class="agent-pip"></span>Rech</div>
+                </div>
+
                 <!-- Traces list + detail split view -->
                 <div class="traces-split">
                     <!-- Left: trace list -->
@@ -113,6 +125,11 @@
                     </div>
                     <div class="thought-body" id="thought-body">
                         <div class="thought-content" id="thought-content"></div>
+                    </div>
+                    <div class="hint-bar" id="hint-bar">
+                        <input type="text" id="hint-input" class="hint-input"
+                               placeholder="Murmurer a l'agent..." maxlength="500">
+                        <button id="hint-send" class="btn-sm hint-send-btn" title="Envoyer le conseil">&#10148;</button>
                     </div>
                 </div>
 
