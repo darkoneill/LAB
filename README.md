@@ -41,7 +41,7 @@ openclaw/
 ├── agent/                  # Cerveau de l'IA
 │   ├── brain.py            # Moteur de raisonnement multi-modele
 │   ├── orchestrator.py     # Orchestration multi-agent hierarchique
-│   ├── swarm.py            # Mode Swarm - sous-agents specialises (Coder/Reviewer/Tester)
+│   ├── swarm.py            # Mode Swarm - sous-agents specialises (7 profils + routage dynamique)
 │   ├── context.py          # Gestion du contexte avec compression
 │   └── prompts/            # Templates de prompts (architecture AgentZero)
 ├── memory/                 # Systeme de memoire (architecture MemU)
@@ -353,6 +353,81 @@ mcp:
 | `/api/approvals/trust`         | DELETE  | Revoquer confiance (`?tool_name=X&server_name=Y`) |
 
 **WebSocket** : `{"type": "batch_approval", "approval_ids": [...], "approved": true, "trust_minutes": 15}`
+
+---
+
+## Sublimation III - Optimisations Millimétriques
+
+### I. Self-Healing Environment-Aware (Contexte Sandbox)
+
+Le prompt de Self-Healing est enrichi avec le contexte du conteneur (OS, version Python, packages installes).
+
+**Principe** : Avant de demander au LLM de corriger le code, l'executor interroge le sandbox pour connaitre l'environnement. Si l'erreur est `ImportError: no module named pandas`, le LLM sait immediatement s'il doit utiliser une alternative stdlib (`csv`) ou generer un `pip install`.
+
+**Exemple de contexte injecte** :
+```
+OS: Debian GNU/Linux 11 (bullseye)
+Python: Python 3.11.9
+Packages:
+pip==24.0
+setuptools==65.5.1
+...
+```
+
+### J. Confiance Spatiale (Path-bound Trust)
+
+La confiance temporaire (Whisper Mode) est desormais scopee par chemin de ressource.
+
+**Principe** : Au lieu de faire confiance a `write_file` globalement, on peut restreindre la confiance a un prefixe de chemin specifique : `write_file` pour `/workspace/mon_projet/` uniquement.
+
+**Resolution de confiance (plus specifique d'abord)** :
+1. Confiance exacte : `server::write_file@/workspace/mon_projet/`
+2. Confiance par prefixe : confiance sur `/workspace/` couvre `/workspace/foo/bar`
+3. Confiance outil global : `server::write_file` (sans restriction de chemin)
+
+### K. Terminal de Pensee (Thought Streaming)
+
+Zone "Terminal de pensee" dans Mission Control qui affiche les tokens de reflexion du LLM en temps reel.
+
+**Fonctionnalites** :
+- Panneau collapsible en bas de Mission Control
+- Texte gris a opacite reduite (style terminal)
+- Badge compteur de chunks recus
+- Auto-scroll vers le bas
+- Support multi-agents avec labels `[coder]`, `[reviewer]`, etc.
+
+**WebSocket** : `{"type": "thinking_stream", "text": "...", "agent": "coder", "new_turn": true}`
+
+### L. Routage Dynamique de l'Essaim
+
+Le Reviewer est desormais un routeur intelligent qui peut deleguer a des agents specialistes.
+
+**Nouveau profil : Security Agent** - Expert OWASP/SANS, analyse les injections, fuites de secrets, SSRF, deserialisation, controle d'acces.
+
+**Directives de routage** : Le Reviewer peut inclure `ROUTE:security` ou `ROUTE:tester` dans son feedback. L'orchestrateur parse ces directives et delegue automatiquement au specialiste.
+
+**7 profils disponibles** :
+
+| Role       | Acces Sandbox | Description                              |
+|------------|---------------|------------------------------------------|
+| `coder`    | Read/Write    | Expert Python strict, code executable    |
+| `reviewer` | Read-Only     | Expert qualite + routeur intelligent     |
+| `critic`   | Aucun         | Auditeur hostile et impartial            |
+| `planner`  | Aucun         | Architecte, decompose les taches         |
+| `tester`   | Read/Write    | Expert tests, ecrit des tests pytest     |
+| `researcher`| Aucun        | Recherche et analyse d'information       |
+| `security` | Read-Only     | Expert securite applicative (OWASP)      |
+
+**Flux avec routage** :
+```
+Coder ecrit le code
+       |
+Reviewer analyse -> APPROVED? -> Critic -> Fin
+       |
+   ROUTE:security -> Security Agent -> Rapport
+       |
+   Feedback enrichi -> Coder corrige
+```
 
 ---
 

@@ -65,6 +65,9 @@ HEALABLE_ERROR_PATTERNS = [
 
 SELF_HEALING_PROMPT = """You generated the following Python code that failed with an error.
 
+## Sandbox Environment
+{sandbox_context}
+
 ## Original Code
 ```python
 {code}
@@ -81,7 +84,7 @@ Analyze the error, understand why it happened, and produce a CORRECTED version o
 Rules:
 - Return ONLY the corrected Python code, no explanations.
 - Do NOT wrap it in markdown code fences.
-- If the error is a missing module, try an alternative approach that doesn't require it.
+- If the error is a missing module, check the installed packages above. If the module is NOT available, rewrite using only stdlib or pre-installed packages instead of importing it.
 - If the error is a logic bug, fix the logic.
 - Preserve the original intent of the code.
 """
@@ -150,6 +153,29 @@ class SandboxExecutor:
         else:
             return await self._execute_direct(tool_name, args)
 
+    async def _get_sandbox_context(self, session_id: str) -> str:
+        """Query the sandbox container for environment info (OS, Python, packages)."""
+        try:
+            container_id = await self.container_manager.get_sandbox_for_session(
+                session_id or "default"
+            )
+            # Run a single command to gather OS, Python version, and installed packages
+            result = await self.container_manager.execute_in_sandbox(
+                container_id,
+                (
+                    "echo \"OS: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"' || uname -s)\" && "
+                    "echo \"Python: $(python3 --version 2>&1)\" && "
+                    "echo \"Packages:\" && pip list --format=freeze 2>/dev/null | head -60"
+                ),
+                timeout=10,
+            )
+            if result.get("success") and result.get("stdout"):
+                return result["stdout"].strip()
+        except Exception as e:
+            logger.debug(f"Failed to query sandbox context: {e}")
+
+        return "OS: unknown, Python: unknown, Packages: unavailable"
+
     def _is_healable_error(self, error: str) -> bool:
         """Check if an error is a candidate for self-healing."""
         if not error:
@@ -196,6 +222,9 @@ class SandboxExecutor:
             f"max_attempts={self._max_heal_attempts}"
         )
 
+        # Gather sandbox environment context once (reused across attempts)
+        sandbox_context = await self._get_sandbox_context(session_id)
+
         for attempt in range(1, self._max_heal_attempts + 1):
             # Ask the LLM to fix the code
             fix_prompt = SELF_HEALING_PROMPT.format(
@@ -203,6 +232,7 @@ class SandboxExecutor:
                 error=current_error,
                 attempt=attempt,
                 max_attempts=self._max_heal_attempts,
+                sandbox_context=sandbox_context,
             )
 
             try:

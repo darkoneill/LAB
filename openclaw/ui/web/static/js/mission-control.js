@@ -257,6 +257,59 @@
     return select ? parseInt(select.value, 10) || 0 : 0;
   }
 
+  // ── Thought Stream Terminal ──────────────────────────────────
+  let thoughtCount = 0;
+
+  function initThoughtTerminal() {
+    const toggle = document.getElementById('thought-toggle');
+    if (toggle) {
+      toggle.addEventListener('click', function () {
+        const terminal = document.getElementById('thought-terminal');
+        if (terminal) {
+          terminal.classList.toggle('collapsed');
+          terminal.classList.toggle('expanded');
+        }
+      });
+    }
+  }
+
+  function appendThought(data) {
+    const content = document.getElementById('thought-content');
+    const badge = document.getElementById('thought-badge');
+    if (!content) return;
+
+    thoughtCount++;
+
+    var chunk = document.createElement('div');
+    chunk.className = 'thought-chunk' + (data.new_turn ? ' thought-new-turn' : '');
+
+    if (data.new_turn && data.agent) {
+      var label = document.createElement('span');
+      label.className = 'thought-label';
+      label.textContent = '[' + escapeHtml(data.agent) + '] ';
+      chunk.appendChild(label);
+    }
+
+    chunk.appendChild(document.createTextNode(data.text || ''));
+    content.appendChild(chunk);
+
+    var body = document.getElementById('thought-body');
+    if (body) body.scrollTop = body.scrollHeight;
+
+    if (badge) {
+      badge.textContent = String(thoughtCount);
+      badge.classList.remove('hidden');
+    }
+  }
+
+  function clearThoughts() {
+    var content = document.getElementById('thought-content');
+    var badge = document.getElementById('thought-badge');
+    if (content) content.innerHTML = '';
+    if (badge) { badge.textContent = '0'; badge.classList.add('hidden'); }
+    thoughtCount = 0;
+  }
+
   // ── WebSocket listener for live updates ───────────────────────
   function setupWsListeners() {
     const origOnMessage = window.wsOnMessage;
@@ -268,6 +321,10 @@
           showApprovalBanner(data);
         } else if (data.type === 'approval_resolved') {
           hideApprovalBanner();
+        } else if (data.type === 'thinking_stream') {
+          appendThought(data);
+        } else if (data.type === 'thinking_clear') {
+          clearThoughts();
         }
       } catch (e) { /* ignore non-JSON */ }
     };
@@ -304,6 +361,7 @@
     const content = document.getElementById('content');
     if (content) observer.observe(content, { subtree: true, attributes: true, attributeFilter: ['class'] });
 
+    initThoughtTerminal();
     setupWsListeners();
   });
 })();
