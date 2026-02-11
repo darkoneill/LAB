@@ -310,6 +310,53 @@
     thoughtCount = 0;
   }
 
+  // ── Human Hinting ──────────────────────────────────────────────
+  function initHintInput() {
+    var input = document.getElementById('hint-input');
+    var btn = document.getElementById('hint-send');
+    if (!input || !btn) return;
+
+    function sendHint() {
+      var text = input.value.trim();
+      if (!text) return;
+      if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+        window.ws.send(JSON.stringify({
+          type: 'human_hint',
+          text: text,
+        }));
+        // Show confirmation in thought terminal
+        appendThought({ text: '[HINT] ' + text, new_turn: true, agent: 'user' });
+        input.value = '';
+      }
+    }
+
+    btn.addEventListener('click', sendHint);
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendHint();
+      }
+    });
+  }
+
+  // ── Swarm Room visualization ──────────────────────────────────
+  function updateSwarmAgent(data) {
+    var room = document.getElementById('swarm-room');
+    if (!room) return;
+
+    // Find the dot matching the role
+    var dots = room.querySelectorAll('.swarm-agent-dot');
+    dots.forEach(function (dot) {
+      if (dot.dataset.role === data.role) {
+        if (data.type === 'agent_spawned') {
+          dot.classList.add('active');
+        } else if (data.type === 'agent_completed' || data.type === 'agent_failed') {
+          dot.classList.remove('active');
+        }
+      }
+    });
+  }
+
   // ── WebSocket listener for live updates ───────────────────────
   function setupWsListeners() {
     const origOnMessage = window.wsOnMessage;
@@ -325,6 +372,8 @@
           appendThought(data);
         } else if (data.type === 'thinking_clear') {
           clearThoughts();
+        } else if (data.type === 'agent_spawned' || data.type === 'agent_completed' || data.type === 'agent_failed') {
+          updateSwarmAgent(data);
         }
       } catch (e) { /* ignore non-JSON */ }
     };
@@ -362,6 +411,7 @@
     if (content) observer.observe(content, { subtree: true, attributes: true, attributeFilter: ['class'] });
 
     initThoughtTerminal();
+    initHintInput();
     setupWsListeners();
   });
 })();

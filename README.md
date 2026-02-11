@@ -429,6 +429,54 @@ Reviewer analyse -> APPROVED? -> Critic -> Fin
    Feedback enrichi -> Coder corrige
 ```
 
+## Sublimation IV - Resilience et Interaction (V7)
+
+### M. Fading Memory (Anti-Token Overflow)
+
+Compression automatique du feedback accumule dans la boucle Coder-Reviewer.
+
+**Principe** : Apres l'iteration 2, si le feedback depasse 3000 caracteres, il est resume via un prompt LLM rapide avant d'etre passe au Coder. Cela evite la saturation de la fenetre de contexte et reduit les couts.
+
+**Fallback** : Si la compression echoue, le feedback est tronque (les issues les plus recentes sont conservees).
+
+### N. patch_file (Edition par Unified Diff)
+
+Nouvel outil sandbox pour editer des fichiers sans les reecrire en entier.
+
+**Format** : Le Coder peut envoyer des edits search/replace :
+```json
+{
+  "tool": "patch_file",
+  "path": "src/app.py",
+  "edits": [
+    {"search": "x = 1", "replace": "x = 2"},
+    {"search": "def old_func():", "replace": "def new_func():"}
+  ]
+}
+```
+
+**Avantage** : Evite les erreurs de troncature sur les gros fichiers (> max_tokens). Meme approche que Aider/Cursor.
+
+### O. Human Hinting (Murmurer a l'Agent)
+
+Injection de contexte humain en temps reel pendant l'execution de l'essaim.
+
+**Fonctionnalite** : Champ "Murmurer a l'agent..." sous le Terminal de Pensee. Le conseil est envoye via WebSocket et injecte comme `[MESSAGE URGENT DE L'UTILISATEUR]` lors de la prochaine iteration du Coder.
+
+**WebSocket** : `{"type": "human_hint", "text": "Utilise csv au lieu de pandas"}`
+
+### P. Salle de Reunion (Swarm Visualization)
+
+Representation graphique de l'essaim d'agents dans Mission Control.
+
+**Fonctionnalite** : Barre horizontale avec des pastilles colorees pour chaque role d'agent. Les pastilles s'illuminent (pulse) quand l'agent correspondant est actif.
+
+**Evenements WebSocket** :
+- `agent_spawned` : la pastille s'active
+- `agent_completed` / `agent_failed` : la pastille s'eteint
+
+**Roles affiches** : Plan (bleu), Code (vert), Review (jaune), Secu (rouge), Test (teal), Critic (rose), Rech (violet).
+
 ---
 
 ## Configuration

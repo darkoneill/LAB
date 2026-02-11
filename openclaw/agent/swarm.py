@@ -51,7 +51,7 @@ AGENT_PROFILES: dict[str, dict] = {
         "temperature": 0.3,
         "max_tokens": 4096,
         "sandbox_access": "read_write",
-        "tools": ["python", "shell", "write_file"],
+        "tools": ["python", "shell", "write_file", "patch_file"],
     },
     AgentRole.REVIEWER: {
         "name": "Reviewer Agent",
@@ -202,12 +202,18 @@ class SwarmOrchestrator:
     Max iterations prevents infinite loops.
     """
 
-    def __init__(self, brain: "AgentBrain"):
+    # Token-safe threshold: compress feedback when it exceeds this char count
+    _FEEDBACK_COMPRESS_THRESHOLD = 3000
+
+    def __init__(self, brain: "AgentBrain", ws_manager=None):
         self.settings = get_settings()
         self.brain = brain
+        self._ws_manager = ws_manager
         self._max_iterations = self.settings.get("agent.swarm.max_iterations", 3)
         self._enabled = self.settings.get("agent.swarm.enabled", True)
         self._active_agents: dict[str, SwarmAgent] = {}
+        # Human hint injection buffer (set via inject_hint)
+        self._pending_hint: str = ""
 
     async def execute_swarm(
         self,
@@ -260,15 +266,42 @@ class SwarmOrchestrator:
 
             # Coder phase
             if AgentRole.CODER in roles:
+                # Inject pending human hint if available
+                hint_block = ""
+                if self._pending_hint:
+                    hint_block = (
+                        f"\n\n[MESSAGE URGENT DE L'UTILISATEUR]\n"
+                        f"{self._pending_hint}\n"
+                        f"[FIN DU MESSAGE]\n"
+                    )
+                    self._pending_hint = ""
+
                 if review_feedback:
+                    # Fading Memory: compress long feedback to avoid token overflow
+                    effective_feedback = review_feedback
+                    if (
+                        iteration > 2
+                        and len(review_feedback) > self._FEEDBACK_COMPRESS_THRESHOLD
+                    ):
+                        effective_feedback = await self._compress_feedback(
+                            review_feedback, iteration
+                        )
+                        trace.append({
+                            "phase": "feedback_compression",
+                            "iteration": iteration,
+                            "original_len": len(review_feedback),
+                            "compressed_len": len(effective_feedback),
+                        })
+
                     coder_task = (
                         f"Tache originale:\n{task}\n\n"
                         f"Code precedent:\n```python\n{current_code}\n```\n\n"
-                        f"Feedback du Reviewer (iteration {iteration}):\n{review_feedback}\n\n"
+                        f"Feedback du Reviewer (iteration {iteration}):\n{effective_feedback}"
+                        f"{hint_block}\n\n"
                         f"Corrige le code en tenant compte de TOUS les points souleves."
                     )
                 else:
-                    coder_task = task
+                    coder_task = task + hint_block
 
                 current_code = await self._run_agent(AgentRole.CODER, coder_task)
                 swarm_result.code = current_code
@@ -392,6 +425,44 @@ class SwarmOrchestrator:
         )
         return swarm_result
 
+    async def _compress_feedback(self, feedback: str, iteration: int) -> str:
+        """
+        Fading Memory: summarize accumulated feedback to prevent token overflow.
+
+        Instead of passing raw multi-iteration feedback to the Coder, we ask
+        the LLM to produce a concise summary of all issues found so far.
+        """
+        compress_prompt = (
+            f"Tu es un assistant de synthese. Voici le feedback accumule de {iteration} "
+            f"iterations de revue de code. Resume-le en un paragraphe concis "
+            f"qui capture TOUS les problemes encore non resolus. "
+            f"Ne perds aucune information critique.\n\n"
+            f"Feedback brut:\n{feedback[:6000]}\n\n"
+            f"Resume concis:"
+        )
+        try:
+            result = await self.brain.generate(
+                messages=[{"role": "user", "content": compress_prompt}],
+                max_tokens=800,
+                temperature=0.1,
+            )
+            compressed = result.get("content", "").strip()
+            if compressed and len(compressed) < len(feedback):
+                logger.info(
+                    f"Fading Memory: compressed feedback {len(feedback)} -> {len(compressed)} chars"
+                )
+                return compressed
+        except Exception as e:
+            logger.warning(f"Fading Memory compression failed: {e}")
+
+        # Fallback: hard-truncate to keep the tail (most recent issues)
+        return feedback[-self._FEEDBACK_COMPRESS_THRESHOLD:]
+
+    def inject_hint(self, hint: str):
+        """Inject a human hint to be consumed by the next Coder iteration."""
+        self._pending_hint = hint
+        logger.info(f"Human hint injected: '{hint[:80]}...'")
+
     @staticmethod
     def _parse_routing(review_output: str) -> list[str]:
         """Parse ROUTE: directives from reviewer output and return agent roles."""
@@ -412,8 +483,10 @@ class SwarmOrchestrator:
         agent = SwarmAgent(role=role, profile=profile, task=task, status="working")
         self._active_agents[agent.id] = agent
 
+        # Notify UI: agent spawned
+        await self._emit_agent_event("agent_spawned", agent)
+
         try:
-            # Build messages with specialized system prompt
             messages = [
                 {"role": "user", "content": task},
             ]
@@ -427,15 +500,34 @@ class SwarmOrchestrator:
 
             agent.result = result.get("content", "")
             agent.status = "completed"
+
+            # Notify UI: agent completed
+            await self._emit_agent_event("agent_completed", agent)
             return agent.result
 
         except Exception as e:
             logger.error(f"Swarm agent {role} failed: {e}")
             agent.status = "failed"
+            await self._emit_agent_event("agent_failed", agent)
             return f"[Agent {role} error: {str(e)}]"
 
         finally:
             self._active_agents.pop(agent.id, None)
+
+    async def _emit_agent_event(self, event_type: str, agent: SwarmAgent):
+        """Emit a swarm agent lifecycle event via WebSocket."""
+        if not self._ws_manager:
+            return
+        try:
+            await self._ws_manager.broadcast({
+                "type": event_type,
+                "agent_id": agent.id,
+                "role": agent.role,
+                "status": agent.status,
+                "task_preview": agent.task[:100],
+            })
+        except Exception:
+            pass  # Non-critical, don't break the swarm
 
     def get_active_agents(self) -> list[dict]:
         """List currently active swarm agents."""
