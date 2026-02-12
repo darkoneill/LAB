@@ -184,6 +184,18 @@ class GatewayServer:
         self.start_time = time.time()
         self._setup_middleware()
         self._setup_routes()
+        self._setup_web_ui()
+
+    def _setup_web_ui(self):
+        """Mount Web UI static files and index route (if enabled)."""
+        if not self.settings.get("ui.web.enabled", True):
+            return
+        try:
+            from openclaw.ui.web.app import setup_web_ui
+            setup_web_ui(self.app)
+            logger.info("Web UI mounted on /")
+        except Exception as e:
+            logger.warning(f"Web UI mount failed (non-fatal): {e}")
 
     def _setup_middleware(self):
         """Configure CORS, security, and performance middleware."""

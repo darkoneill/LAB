@@ -112,11 +112,7 @@ async def run_gateway(components, settings):
         memory_manager=components["memory_manager"],
         skill_router=components["skill_router"],
     )
-
-    # Mount Web UI
-    if settings.get("ui.web.enabled", True):
-        from openclaw.ui.web.app import setup_web_ui
-        setup_web_ui(gateway.app)
+    # Web UI is now auto-mounted inside GatewayServer.__init__
 
     await gateway.start()
 
@@ -128,11 +124,7 @@ async def run_both(components, settings):
         memory_manager=components["memory_manager"],
         skill_router=components["skill_router"],
     )
-
-    # Mount Web UI
-    if settings.get("ui.web.enabled", True):
-        from openclaw.ui.web.app import setup_web_ui
-        setup_web_ui(gateway.app)
+    # Web UI is now auto-mounted inside GatewayServer.__init__
 
     # Start gateway in background
     import uvicorn
