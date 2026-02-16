@@ -6,11 +6,22 @@ only 4 default tools, the agent creates the rest.
 
 import asyncio
 import logging
+import os
+from pathlib import Path as _Path
 from typing import Optional
 
 from openclaw.config.settings import get_settings
 
 logger = logging.getLogger("openclaw.tools")
+
+# Paths that should NEVER be accessed by file tools
+_SENSITIVE_PATHS = {
+    "/etc/shadow", "/etc/passwd", "/etc/sudoers",
+    "/root/.ssh", "/root/.bashrc", "/root/.bash_history",
+}
+_SENSITIVE_PREFIXES = (
+    "/etc/ssh/", "/proc/", "/sys/", "/dev/",
+)
 
 
 class ToolExecutor:
@@ -67,6 +78,35 @@ class ToolExecutor:
             desc = descriptions.get(name, f"Custom tool: {name}")
             parts.append(f"- `{name}`: {desc}")
         return "\n".join(parts)
+
+    # ── Path Security ─────────────────────────────────────────
+
+    def _validate_path(self, path: str) -> tuple[bool, str]:
+        """Validate a file path against security policies.
+        Returns (allowed, error_message)."""
+        try:
+            resolved = _Path(path).resolve()
+        except (OSError, ValueError) as e:
+            return False, f"Invalid path: {e}"
+
+        resolved_str = str(resolved)
+
+        # Check blocked paths from config
+        blocked = self.settings.get("tools.file_manager.blocked_paths", [])
+        for bp in blocked:
+            if resolved_str == bp or resolved_str.startswith(bp + "/"):
+                return False, "Path blocked by security policy"
+
+        # Check hardcoded sensitive paths
+        for sp in _SENSITIVE_PATHS:
+            if resolved_str == sp or resolved_str.startswith(sp + "/"):
+                return False, "Access to sensitive path denied"
+
+        for prefix in _SENSITIVE_PREFIXES:
+            if resolved_str.startswith(prefix):
+                return False, "Access to sensitive path denied"
+
+        return True, ""
 
     # ── Default Tools ─────────────────────────────────────────
 
@@ -140,8 +180,11 @@ class ToolExecutor:
         if not path:
             return {"success": False, "error": "No path provided"}
 
-        from pathlib import Path as P
-        p = P(path)
+        allowed, err = self._validate_path(path)
+        if not allowed:
+            return {"success": False, "error": err}
+
+        p = _Path(path)
 
         if not p.exists():
             return {"success": False, "error": f"File not found: {path}"}
@@ -161,8 +204,11 @@ class ToolExecutor:
         if not path:
             return {"success": False, "error": "No path provided"}
 
-        from pathlib import Path as P
-        p = P(path)
+        allowed, err = self._validate_path(path)
+        if not allowed:
+            return {"success": False, "error": err}
+
+        p = _Path(path)
 
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -173,8 +219,11 @@ class ToolExecutor:
 
     async def _tool_search_files(self, path: str = ".", pattern: str = "*", **kwargs) -> dict:
         """Search for files matching a pattern."""
-        from pathlib import Path as P
-        p = P(path)
+        allowed, err = self._validate_path(path)
+        if not allowed:
+            return {"success": False, "error": err}
+
+        p = _Path(path)
 
         if not p.exists():
             return {"success": False, "error": f"Path not found: {path}"}

@@ -15,8 +15,8 @@ class WebSearchSkill(BaseSkill):
     description = "Search the web for information using SearXNG or DuckDuckGo"
     tags = ["search", "web", "internet", "query", "find", "lookup"]
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, skill_path=None):
+        super().__init__(skill_path=skill_path)
         self.settings = get_settings()
 
     async def execute(self, **kwargs) -> dict:

@@ -92,12 +92,16 @@ class SessionManager:
 
     def add_message(self, session_id: str, role: str, content: str, metadata: dict = None):
         if session_id in self.sessions:
-            self.sessions[session_id]["messages"].append({
+            msgs = self.sessions[session_id]["messages"]
+            msgs.append({
                 "role": role,
                 "content": content,
                 "timestamp": time.time(),
                 "metadata": metadata or {},
             })
+            # Cap at 200 messages per session to prevent unbounded RAM growth
+            if len(msgs) > 200:
+                self.sessions[session_id]["messages"] = msgs[-200:]
 
     def get_history(self, session_id: str, limit: int = 50) -> list[dict]:
         if session_id in self.sessions:
@@ -383,12 +387,9 @@ class GatewayServer:
         @self.app.get("/api/config")
         async def get_config():
             """Return safe (no secrets) config."""
-            cfg = self.settings.all()
-            # Redact API keys
-            for provider in cfg.get("providers", {}).values():
-                if isinstance(provider, dict) and "api_key" in provider:
-                    key = provider["api_key"]
-                    provider["api_key"] = f"***{key[-4:]}" if key and len(key) > 4 else ""
+            import copy
+            cfg = copy.deepcopy(self.settings.all())
+            self._redact_secrets(cfg)
             return cfg
 
         @self.app.put("/api/config")
@@ -783,6 +784,22 @@ class GatewayServer:
                         "context_window": m.get("context_window", 128000),
                     })
         return models
+
+    @staticmethod
+    def _redact_secrets(obj, _path=""):
+        """Recursively redact sensitive values in a config dict."""
+        sensitive_keys = {"api_key", "secret", "password", "token", "private_key"}
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key_lower = k.lower()
+                if any(s in key_lower for s in sensitive_keys):
+                    if isinstance(v, str) and v:
+                        obj[k] = f"***{v[-4:]}" if len(v) > 4 else "***"
+                else:
+                    GatewayServer._redact_secrets(v, f"{_path}.{k}")
+        elif isinstance(obj, list):
+            for item in obj:
+                GatewayServer._redact_secrets(item, _path)
 
     def _rate_limit_headers(self, rate_info: dict) -> dict:
         """Generate X-RateLimit-* headers from rate info."""

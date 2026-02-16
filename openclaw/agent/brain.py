@@ -66,6 +66,7 @@ class AgentBrain:
         self._personality = ""
         self._tools_prompt = ""
         self._load_prompts()
+        self._tool_definitions = None  # cached tool defs
 
     def _load_prompts(self):
         """Load prompt templates from files."""
@@ -106,6 +107,99 @@ class AgentBrain:
             parts.append(COT_INSTRUCTION)
 
         return "\n".join(parts)
+
+    def _get_tool_definitions_anthropic(self) -> list[dict]:
+        """Build Anthropic-format tool definitions from executor + skills."""
+        if self._tool_definitions is not None:
+            return self._tool_definitions
+
+        tools = []
+
+        # Default tools from executor
+        if self.tool_executor:
+            tools.append({
+                "name": "shell",
+                "description": "Execute a shell command on the system.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The shell command to execute"},
+                        "timeout": {"type": "integer", "description": "Timeout in seconds (optional)"},
+                    },
+                    "required": ["command"],
+                },
+            })
+            tools.append({
+                "name": "read_file",
+                "description": "Read the contents of a file.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file to read"},
+                    },
+                    "required": ["path"],
+                },
+            })
+            tools.append({
+                "name": "write_file",
+                "description": "Write content to a file (creates or overwrites).",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file"},
+                        "content": {"type": "string", "description": "Content to write"},
+                    },
+                    "required": ["path", "content"],
+                },
+            })
+            tools.append({
+                "name": "search_files",
+                "description": "Search for files matching a glob pattern.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Root directory to search in"},
+                        "pattern": {"type": "string", "description": "Glob pattern to match"},
+                    },
+                    "required": ["pattern"],
+                },
+            })
+
+        # Skills as tools
+        if self.skill_router:
+            for skill_info in self.skill_router.list_skills():
+                name = skill_info["name"]
+                desc = skill_info.get("description", name)
+                # Generic skill invocation schema
+                tools.append({
+                    "name": f"skill_{name}",
+                    "description": f"Skill: {desc}",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "The query or input for this skill"},
+                        },
+                        "required": ["query"],
+                    },
+                })
+
+        self._tool_definitions = tools
+        return tools
+
+    def _get_tool_definitions_openai(self) -> list[dict]:
+        """Build OpenAI-format tool definitions (function calling)."""
+        anthropic_tools = self._get_tool_definitions_anthropic()
+        openai_tools = []
+        for t in anthropic_tools:
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                },
+            })
+        return openai_tools
 
     def _extract_thinking(self, content: str) -> tuple[str, str]:
         """Extract thinking blocks from response content.
@@ -327,7 +421,8 @@ class AgentBrain:
         client = self._get_anthropic_client()
         system, formatted = self._format_messages_anthropic(messages, system_msg)
 
-        response = await client.messages.create(
+        # Build request kwargs
+        kwargs = dict(
             model=model_id,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -335,10 +430,24 @@ class AgentBrain:
             messages=formatted,
         )
 
+        # Inject native tool definitions if executor is available
+        tools = self._get_tool_definitions_anthropic()
+        if tools and self.tool_executor:
+            kwargs["tools"] = tools
+
+        response = await client.messages.create(**kwargs)
+
         content = ""
+        tool_calls = []
         for block in response.content:
             if hasattr(block, "text"):
                 content += block.text
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "arguments": block.input if isinstance(block.input, dict) else {},
+                })
 
         return {
             "content": content,
@@ -348,7 +457,7 @@ class AgentBrain:
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
             },
-            "tool_calls": [],
+            "tool_calls": tool_calls,
         }
 
     async def _call_openai_compat(
@@ -358,15 +467,39 @@ class AgentBrain:
         client = self._get_provider_client(provider_name)
         formatted = self._format_messages_openai(messages, system_msg)
 
-        response = await client.chat.completions.create(
+        kwargs = dict(
             model=model_id,
             messages=formatted,
             temperature=temperature,
             max_tokens=max_tokens,
         )
 
+        # Inject native tool definitions (skip for ollama which may not support it)
+        if provider_name not in ("ollama",) and self.tool_executor:
+            tools = self._get_tool_definitions_openai()
+            if tools:
+                kwargs["tools"] = tools
+
+        response = await client.chat.completions.create(**kwargs)
+
         choice = response.choices[0]
         usage = response.usage
+
+        # Parse tool calls from OpenAI response
+        tool_calls = []
+        if choice.message.tool_calls:
+            for tc in choice.message.tool_calls:
+                args = tc.function.arguments
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {"query": args}
+                tool_calls.append({
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": args,
+                })
 
         return {
             "content": choice.message.content or "",
@@ -376,7 +509,7 @@ class AgentBrain:
                 "output_tokens": usage.completion_tokens if usage else 0,
                 "total_tokens": usage.total_tokens if usage else 0,
             },
-            "tool_calls": [],
+            "tool_calls": tool_calls,
         }
 
     async def _stream_anthropic(
@@ -422,7 +555,16 @@ class AgentBrain:
             tool_name = tc.get("name", "")
             tool_args = tc.get("arguments", {})
             try:
-                result = await self.tool_executor.execute(tool_name, tool_args)
+                # Route skill_ prefixed tools to skill_router
+                if tool_name.startswith("skill_") and self.skill_router:
+                    real_name = tool_name[6:]  # strip "skill_"
+                    skill = self.skill_router.loader.get_skill(real_name)
+                    if skill:
+                        result = await skill.execute(**tool_args)
+                    else:
+                        result = {"success": False, "error": f"Skill not found: {real_name}"}
+                else:
+                    result = await self.tool_executor.execute(tool_name, tool_args)
                 results.append({"tool": tool_name, "success": True, "result": result})
             except Exception as e:
                 results.append({"tool": tool_name, "success": False, "error": str(e)})
