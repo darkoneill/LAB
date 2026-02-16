@@ -238,14 +238,22 @@ class VectorStore:
 # ── Embedding Providers ──────────────────────────────────────
 
 class SentenceTransformerEmbedder:
-    """Embedding using sentence-transformers (local, no API)."""
+    """Embedding using sentence-transformers (local, no API). Lazy-loaded."""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        from sentence_transformers import SentenceTransformer
-        self.model = SentenceTransformer(model_name)
+        self._model_name = model_name
+        self._model = None
+
+    def _get_model(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self._model_name)
+            logger.info(f"SentenceTransformer model loaded: {self._model_name}")
+        return self._model
 
     def embed(self, text: str) -> list[float]:
-        embedding = self.model.encode(text, convert_to_numpy=True)
+        model = self._get_model()
+        embedding = model.encode(text, convert_to_numpy=True)
         return embedding.tolist()
 
 
