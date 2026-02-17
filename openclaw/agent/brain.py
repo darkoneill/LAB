@@ -186,6 +186,10 @@ class AgentBrain:
         self._tool_definitions = tools
         return tools
 
+    def invalidate_tool_cache(self):
+        """Call this when skills are added/removed at runtime."""
+        self._tool_definitions = None
+
     def _get_tool_definitions_openai(self) -> list[dict]:
         """Build OpenAI-format tool definitions (function calling)."""
         anthropic_tools = self._get_tool_definitions_anthropic()
@@ -301,6 +305,13 @@ class AgentBrain:
         # Ensure first message is from user
         if not formatted or formatted[0]["role"] != "user":
             formatted.insert(0, {"role": "user", "content": "(conversation start)"})
+
+        # Context window trimming: ~100k tokens safety limit (4 chars ≈ 1 token)
+        max_context_chars = 400_000
+        total_chars = sum(len(str(m.get("content", ""))) for m in formatted)
+        while total_chars > max_context_chars and len(formatted) > 1:
+            removed = formatted.pop(0)
+            total_chars -= len(str(removed.get("content", "")))
 
         return system_msg, formatted
 
