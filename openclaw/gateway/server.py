@@ -15,10 +15,10 @@ from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from openclaw.config.settings import get_settings
-from openclaw.gateway.middleware import RateLimiter
+from openclaw.gateway.middleware import RateLimiter, SecurityMiddleware, SemanticCache
 from openclaw.gateway.approval import ApprovalMiddleware
 from openclaw.tracing import get_tracer
 
@@ -43,6 +43,16 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     tools: Optional[list[str]] = None
     metadata: Optional[dict] = None
+
+    @field_validator("messages")
+    @classmethod
+    def validate_messages(cls, v):
+        for msg in v:
+            if len(msg.content) > 32_000:
+                raise ValueError("Message content exceeds 32,000 characters")
+        if len(v) > 200:
+            raise ValueError("Too many messages in a single request")
+        return v
 
 
 class ChatResponse(BaseModel):
@@ -180,6 +190,8 @@ class GatewayServer:
         self.sessions = SessionManager()
         self.ws_manager = ConnectionManager()
         self.rate_limiter = RateLimiter()
+        self.security = SecurityMiddleware()
+        self.cache = SemanticCache()
         self.tracer = get_tracer()
         self.approval = ApprovalMiddleware(ws_manager=self.ws_manager)
         # Chronotaches: background task scheduler
@@ -253,8 +265,14 @@ class GatewayServer:
             # Get client identifier for rate limiting
             client_id = req.headers.get("X-Client-Id", req.client.host if req.client else "unknown")
 
-            # Estimate tokens (rough: 4 chars = 1 token)
+            # Security validation
             total_content = "".join(m.content for m in request.messages)
+            api_key = req.headers.get("X-API-Key", "")
+            valid, reason = self.security.validate_request(content=total_content, api_key=api_key)
+            if not valid:
+                raise HTTPException(400, f"Request rejected: {reason}")
+
+            # Estimate tokens (rough: 4 chars = 1 token)
             estimated_tokens = len(total_content) // 4 + (request.max_tokens or 1000)
 
             # Check rate limit
@@ -286,6 +304,10 @@ class GatewayServer:
 
             # Non-streaming response
             response = await self._generate_response(session, request)
+            # Record actual token usage
+            real_tokens = response.usage.get("total_tokens", 0) if response.usage else 0
+            if real_tokens:
+                self.rate_limiter.record_tokens(client_id, real_tokens)
             return JSONResponse(
                 content=response.model_dump(),
                 headers=self._rate_limit_headers(rate_info),
@@ -303,6 +325,14 @@ class GatewayServer:
 
             if not message:
                 raise HTTPException(400, "Message is required")
+            if len(message) > 32_000:
+                raise HTTPException(400, "Message exceeds 32,000 characters")
+
+            # Security validation
+            api_key = request.headers.get("X-API-Key", "")
+            valid, reason = self.security.validate_request(content=message, api_key=api_key)
+            if not valid:
+                raise HTTPException(400, f"Request rejected: {reason}")
 
             # Estimate tokens and check rate limit
             estimated_tokens = len(message) // 4 + 1000
@@ -328,6 +358,19 @@ class GatewayServer:
             )
 
         # ── Sessions ─────────────────────────────────────
+        @self.app.post("/api/sessions")
+        async def create_session(request: Request):
+            body = {}
+            if request.headers.get("content-type", "").startswith("application/json"):
+                body = await request.json()
+            session_id = body.get("session_id", None)
+            session = self.sessions.get_or_create(session_id)
+            return {
+                "id": session["id"],
+                "created_at": session["created_at"],
+                "message_count": 0,
+            }
+
         @self.app.get("/api/sessions")
         async def list_sessions():
             return {
@@ -344,9 +387,9 @@ class GatewayServer:
 
         @self.app.get("/api/sessions/{session_id}/history")
         async def get_session_history(session_id: str, limit: int = 50):
-            history = self.sessions.get_history(session_id, limit)
-            if not history:
+            if session_id not in self.sessions.sessions:
                 raise HTTPException(404, "Session not found")
+            history = self.sessions.get_history(session_id, limit)
             return {"session_id": session_id, "messages": history}
 
         @self.app.delete("/api/sessions/{session_id}")
@@ -394,7 +437,18 @@ class GatewayServer:
 
         @self.app.put("/api/config")
         async def update_config(request: Request):
+            # Admin key protection
+            admin_key = request.headers.get("X-Admin-Key", "")
+            expected = self.settings.get("gateway.admin_key", "")
+            if expected and admin_key != expected:
+                raise HTTPException(403, "Admin key required")
+
             body = await request.json()
+            # Blacklist dangerous keys
+            blocked_prefixes = {"gateway.admin_key", "gateway.security.api_keys"}
+            for dotpath in body:
+                if any(dotpath.startswith(b) for b in blocked_prefixes):
+                    raise HTTPException(403, f"Cannot modify protected key: {dotpath}")
             for dotpath, value in body.items():
                 self.settings.set(dotpath, value, persist=True)
             return {"updated": list(body.keys())}
@@ -667,10 +721,18 @@ class GatewayServer:
                                 "content": chunk,
                             })
 
-                        self.sessions.add_message(session["id"], "assistant", full_response)
+                        # Filter output and store (WS caller responsibility)
+                        filtered = self.security.filter_output(full_response)
+                        self.sessions.add_message(session["id"], "assistant", filtered)
+                        if self.memory and chat_req.messages:
+                            await self.memory.store_interaction(
+                                user_message=content,
+                                assistant_response=filtered,
+                                session_id=session["id"],
+                            )
                         await self.ws_manager.send_message(client_id, {
                             "type": "end",
-                            "content": full_response,
+                            "content": filtered,
                         })
 
                     elif msg_type == "ping":
@@ -688,11 +750,18 @@ class GatewayServer:
                 model="none",
             )
 
+        last_msg = request.messages[-1].content if request.messages else ""
+
+        # Check semantic cache
+        cached = self.cache.get(last_msg, model=request.model or "")
+        if cached:
+            self.sessions.add_message(session["id"], "assistant", cached.get("content", ""))
+            return ChatResponse(session_id=session["id"], **cached)
+
         # Build context from session history + memory
         context_messages = self.sessions.get_history(session["id"])
         memory_context = ""
         if self.memory:
-            last_msg = request.messages[-1].content if request.messages else ""
             memory_results = await self.memory.search(last_msg, top_k=5)
             if memory_results:
                 memory_context = "\n".join([r.get("content", "") for r in memory_results])
@@ -705,33 +774,59 @@ class GatewayServer:
             max_tokens=request.max_tokens,
         )
 
+        # Filter output through security middleware
+        content = self.security.filter_output(response.get("content", ""))
+        response["content"] = content
+
+        # Store in semantic cache
+        self.cache.put(last_msg, model=response.get("model", ""), response={
+            "content": content,
+            "model": response.get("model", ""),
+            "usage": response.get("usage", {}),
+        })
+
         # Store assistant response
-        self.sessions.add_message(session["id"], "assistant", response.get("content", ""))
+        self.sessions.add_message(session["id"], "assistant", content)
 
         # Store in memory
         if self.memory and request.messages:
             await self.memory.store_interaction(
-                user_message=request.messages[-1].content,
-                assistant_response=response.get("content", ""),
+                user_message=last_msg,
+                assistant_response=content,
                 session_id=session["id"],
             )
 
         return ChatResponse(
             session_id=session["id"],
-            content=response.get("content", ""),
+            content=content,
             model=response.get("model", ""),
             usage=response.get("usage", {}),
             tool_calls=response.get("tool_calls", []),
         )
 
     async def _stream_response(self, session: dict, request: ChatRequest) -> AsyncGenerator[str, None]:
-        """SSE streaming response."""
+        """SSE streaming response with storage after completion."""
+        full_response = ""
         async for chunk in self._generate_stream(session, request):
+            full_response += chunk
             yield f"data: {json.dumps({'content': chunk})}\n\n"
+
+        # Store assistant response (SSE caller responsibility)
+        filtered = self.security.filter_output(full_response)
+        self.sessions.add_message(session["id"], "assistant", filtered)
+        if self.memory and request.messages:
+            await self.memory.store_interaction(
+                user_message=request.messages[-1].content,
+                assistant_response=filtered,
+                session_id=session["id"],
+            )
         yield "data: [DONE]\n\n"
 
     async def _generate_stream(self, session: dict, request: ChatRequest) -> AsyncGenerator[str, None]:
-        """Generate streaming chunks from the agent."""
+        """Generate streaming chunks from the agent.
+        NOTE: Storage (add_message, memory) is the caller's responsibility
+        (WS handler or _stream_response), NOT this method's.
+        """
         if not self.agent:
             yield "Agent not initialized."
             return
@@ -744,7 +839,6 @@ class GatewayServer:
             if memory_results:
                 memory_context = "\n".join([r.get("content", "") for r in memory_results])
 
-        full_response = ""
         async for chunk in self.agent.generate_stream(
             messages=context_messages,
             memory_context=memory_context,
@@ -752,16 +846,7 @@ class GatewayServer:
             temperature=request.temperature,
             max_tokens=request.max_tokens,
         ):
-            full_response += chunk
             yield chunk
-
-        self.sessions.add_message(session["id"], "assistant", full_response)
-        if self.memory and request.messages:
-            await self.memory.store_interaction(
-                user_message=request.messages[-1].content,
-                assistant_response=full_response,
-                session_id=session["id"],
-            )
 
     def _get_active_providers(self) -> list[str]:
         providers = []

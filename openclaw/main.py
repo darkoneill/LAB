@@ -126,6 +126,10 @@ async def run_both(components, settings):
     )
     # Web UI is now auto-mounted inside GatewayServer.__init__
 
+    # Start background tasks (cleanup + scheduler)
+    cleanup_task = asyncio.create_task(gateway._session_cleanup_loop())
+    await gateway.scheduler.start()
+
     # Start gateway in background
     import uvicorn
     host = settings.get("gateway.host", "127.0.0.1")
@@ -152,9 +156,15 @@ async def run_both(components, settings):
         await terminal.run()
     finally:
         server.should_exit = True
+        await gateway.scheduler.stop()
+        cleanup_task.cancel()
         gateway_task.cancel()
         try:
             await gateway_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await cleanup_task
         except asyncio.CancelledError:
             pass
 
