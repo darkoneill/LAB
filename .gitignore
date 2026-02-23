@@ -38,3 +38,8 @@ Thumbs.db
 
 # Backups
 backups/
+
+# Testing artifacts
+.coverage
+htmlcov/
+.pytest_cache/
