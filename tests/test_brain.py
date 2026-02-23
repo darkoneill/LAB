@@ -312,9 +312,122 @@ class TestMessageFormatting:
         assert formatted[0]["content"] == "sys prompt"
 
     def test_openai_remaps_unknown_role(self, brain):
-        messages = [{"role": "tool_result", "content": "ok"}]
+        messages = [{"role": "function", "content": "ok"}]
         formatted = brain._format_messages_openai(messages, "sys")
         assert formatted[1]["role"] == "user"
+
+    # ── Anthropic tool_calls + tool_result formatting ──
+
+    def test_anthropic_assistant_with_tool_calls(self, brain):
+        """Assistant message with tool_calls → content blocks (text + tool_use)."""
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+            },
+        ]
+        _, formatted = brain._format_messages_anthropic(messages, "sys")
+        assistant_msg = formatted[-1]
+        assert assistant_msg["role"] == "assistant"
+        assert isinstance(assistant_msg["content"], list)
+        assert assistant_msg["content"][0]["type"] == "text"
+        assert assistant_msg["content"][0]["text"] == "Let me check."
+        assert assistant_msg["content"][1]["type"] == "tool_use"
+        assert assistant_msg["content"][1]["id"] == "tu_1"
+        assert assistant_msg["content"][1]["name"] == "shell"
+        assert assistant_msg["content"][1]["input"]["command"] == "ls"
+
+    def test_anthropic_tool_result_message(self, brain):
+        """tool_result role → user message with tool_result content blocks."""
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+            },
+            {
+                "role": "tool_result",
+                "tool_results": [{"tool_use_id": "tu_1", "content": "file1.txt\nfile2.txt"}],
+            },
+        ]
+        _, formatted = brain._format_messages_anthropic(messages, "sys")
+        tool_result_msg = formatted[-1]
+        assert tool_result_msg["role"] == "user"
+        assert isinstance(tool_result_msg["content"], list)
+        assert tool_result_msg["content"][0]["type"] == "tool_result"
+        assert tool_result_msg["content"][0]["tool_use_id"] == "tu_1"
+        assert "file1.txt" in tool_result_msg["content"][0]["content"]
+
+    def test_anthropic_no_merge_after_blocks(self, brain):
+        """Plain text user msg after tool_result blocks should NOT be merged."""
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+            },
+            {
+                "role": "tool_result",
+                "tool_results": [{"tool_use_id": "tu_1", "content": "ok"}],
+            },
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "thanks"},
+        ]
+        _, formatted = brain._format_messages_anthropic(messages, "sys")
+        # Should have: user, assistant(blocks), user(tool_result blocks), assistant, user
+        assert len(formatted) == 5
+
+    # ── OpenAI tool_calls + tool_result formatting ──
+
+    def test_openai_assistant_with_tool_calls(self, brain):
+        """Assistant message with tool_calls → OpenAI tool_calls array."""
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "Checking.",
+                "tool_calls": [{"id": "call_1", "name": "shell", "arguments": {"command": "ls"}}],
+            },
+        ]
+        formatted = brain._format_messages_openai(messages, "sys")
+        assistant_msg = formatted[-1]
+        assert assistant_msg["role"] == "assistant"
+        assert len(assistant_msg["tool_calls"]) == 1
+        tc = assistant_msg["tool_calls"][0]
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "shell"
+        assert json.loads(tc["function"]["arguments"]) == {"command": "ls"}
+
+    def test_openai_tool_result_messages(self, brain):
+        """tool_result role → one 'tool' message per result."""
+        messages = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "name": "shell", "arguments": {"command": "ls"}},
+                    {"id": "call_2", "name": "read_file", "arguments": {"path": "/tmp/x"}},
+                ],
+            },
+            {
+                "role": "tool_result",
+                "tool_results": [
+                    {"tool_use_id": "call_1", "content": "file.txt"},
+                    {"tool_use_id": "call_2", "content": "contents"},
+                ],
+            },
+        ]
+        formatted = brain._format_messages_openai(messages, "sys")
+        tool_msgs = [m for m in formatted if m["role"] == "tool"]
+        assert len(tool_msgs) == 2
+        assert tool_msgs[0]["tool_call_id"] == "call_1"
+        assert tool_msgs[0]["content"] == "file.txt"
+        assert tool_msgs[1]["tool_call_id"] == "call_2"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -613,10 +726,142 @@ class TestGenerate:
         tool_executor.execute.assert_called_once_with("shell", {"command": "ls"})
 
     @pytest.mark.asyncio
-    async def test_generate_max_iterations(self, brain, fake_settings):
-        fake_settings._data["agent.max_iterations"] = 2
-        result = await brain.generate([{"role": "user", "content": "hi"}], iteration=2)
-        assert "Max iterations" in result["content"]
+    async def test_generate_max_tool_rounds_exhausted(self, brain, tool_executor):
+        """When max_tool_rounds is reached, stop looping and return with warning."""
+        resp_with_tool = _make_anthropic_response(
+            text="Calling tool.",
+            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
+            input_tokens=5, output_tokens=10,
+        )
+        mock_client = MagicMock()
+        # Always returns tool_calls — never a text-only response
+        mock_client.messages.create = AsyncMock(return_value=resp_with_tool)
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            result = await brain.generate(
+                [{"role": "user", "content": "loop forever"}],
+                max_tool_rounds=1,
+            )
+
+        assert "[Max tool rounds reached]" in result["content"]
+        # Round 0: call LLM → tool_calls → execute → loop
+        # Round 1: call LLM → tool_calls → round_idx >= max_tool_rounds → stop
+        assert mock_client.messages.create.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_generate_cumulative_usage(self, brain, tool_executor):
+        """Usage tokens should accumulate across multiple rounds."""
+        resp_tool = _make_anthropic_response(
+            text="",
+            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
+            input_tokens=100, output_tokens=50,
+        )
+        resp_final = _make_anthropic_response(
+            text="Done.",
+            input_tokens=200, output_tokens=80,
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(side_effect=[resp_tool, resp_final])
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            result = await brain.generate([{"role": "user", "content": "go"}])
+
+        assert result["usage"]["input_tokens"] == 300
+        assert result["usage"]["output_tokens"] == 130
+        assert result["usage"]["total_tokens"] == 430
+
+    @pytest.mark.asyncio
+    async def test_generate_does_not_mutate_caller_messages(self, brain, tool_executor):
+        """The caller's message list must not be mutated by the agentic loop."""
+        resp_tool = _make_anthropic_response(
+            text="",
+            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
+        )
+        resp_final = _make_anthropic_response(text="Done.")
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(side_effect=[resp_tool, resp_final])
+
+        original_messages = [{"role": "user", "content": "hi"}]
+        original_len = len(original_messages)
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            await brain.generate(original_messages)
+
+        assert len(original_messages) == original_len
+
+    @pytest.mark.asyncio
+    async def test_generate_tool_results_passed_to_llm(self, brain, tool_executor):
+        """Verify that tool_result messages are included when re-calling the LLM."""
+        resp_tool = _make_anthropic_response(
+            text="Running.",
+            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "pwd"}}],
+        )
+        resp_final = _make_anthropic_response(text="You are in /home.")
+
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(side_effect=[resp_tool, resp_final])
+        tool_executor.execute = AsyncMock(return_value={"stdout": "/home"})
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            await brain.generate([{"role": "user", "content": "where am I?"}])
+
+        # Second call should have more messages (assistant + tool_result appended)
+        second_call_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+        second_messages = second_call_kwargs["messages"]
+        # Should contain: user, assistant(tool_use blocks), user(tool_result blocks)
+        assert len(second_messages) >= 3
+        # Last message should be a user message with tool_result content blocks
+        last_msg = second_messages[-1]
+        assert last_msg["role"] == "user"
+        assert isinstance(last_msg["content"], list)
+        assert last_msg["content"][0]["type"] == "tool_result"
+        assert last_msg["content"][0]["tool_use_id"] == "tu_1"
+
+    @pytest.mark.asyncio
+    async def test_generate_multi_round_loop(self, brain, tool_executor):
+        """Verify 3-round tool loop: tool → tool → text."""
+        resp_tool_1 = _make_anthropic_response(
+            text="Step 1",
+            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
+            input_tokens=10, output_tokens=5,
+        )
+        resp_tool_2 = _make_anthropic_response(
+            text="Step 2",
+            tool_use_blocks=[{"id": "tu_2", "name": "read_file", "input": {"path": "/tmp/x"}}],
+            input_tokens=20, output_tokens=10,
+        )
+        resp_final = _make_anthropic_response(
+            text="All done.",
+            input_tokens=30, output_tokens=15,
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(side_effect=[resp_tool_1, resp_tool_2, resp_final])
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            result = await brain.generate([{"role": "user", "content": "do it all"}])
+
+        assert result["content"] == "All done."
+        assert mock_client.messages.create.call_count == 3
+        assert tool_executor.execute.call_count == 2
+        assert result["usage"]["input_tokens"] == 60
+        assert result["usage"]["output_tokens"] == 30
+
+    @pytest.mark.asyncio
+    async def test_generate_no_tool_executor_skips_loop(self, brain_no_tools):
+        """Without tool_executor, tool_calls in response are returned as-is (no loop)."""
+        resp = _make_anthropic_response(
+            text="I would call a tool.",
+            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
+        )
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(return_value=resp)
+
+        with patch.object(brain_no_tools, "_get_anthropic_client", return_value=mock_client):
+            result = await brain_no_tools.generate([{"role": "user", "content": "hi"}])
+
+        # Should return immediately without executing tools
+        assert mock_client.messages.create.call_count == 1
+        assert result["content"] == "I would call a tool."
 
     @pytest.mark.asyncio
     async def test_generate_failover(self, brain):

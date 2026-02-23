@@ -287,17 +287,51 @@ class AgentBrain:
             raise RuntimeError("openai package not installed. Run: pip install openai")
 
     def _format_messages_anthropic(self, messages: list[dict], system_msg: str) -> tuple[str, list[dict]]:
-        """Format messages for Anthropic API."""
+        """Format messages for Anthropic API.
+
+        Handles special internal roles:
+        - assistant messages with 'tool_calls' → content blocks (text + tool_use)
+        - 'tool_result' messages → user message with tool_result content blocks
+        """
         formatted = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+
             if role == "system":
                 continue
+
+            # Assistant message that used tools → structured content blocks
+            if role == "assistant" and msg.get("tool_calls"):
+                blocks = []
+                if content:
+                    blocks.append({"type": "text", "text": content})
+                for tc in msg["tool_calls"]:
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "input": tc.get("arguments", {}),
+                    })
+                formatted.append({"role": "assistant", "content": blocks})
+                continue
+
+            # Tool results → user message with tool_result content blocks
+            if role == "tool_result":
+                blocks = []
+                for tr in msg.get("tool_results", []):
+                    blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": tr["tool_use_id"],
+                        "content": tr.get("content", ""),
+                    })
+                formatted.append({"role": "user", "content": blocks})
+                continue
+
             if role not in ("user", "assistant"):
                 role = "user"
-            # Avoid consecutive same-role messages
-            if formatted and formatted[-1]["role"] == role:
+            # Avoid consecutive same-role messages (only for plain text)
+            if formatted and formatted[-1]["role"] == role and isinstance(formatted[-1].get("content"), str):
                 formatted[-1]["content"] += f"\n{content}"
             else:
                 formatted.append({"role": role, "content": content})
@@ -316,11 +350,46 @@ class AgentBrain:
         return system_msg, formatted
 
     def _format_messages_openai(self, messages: list[dict], system_msg: str) -> list[dict]:
-        """Format messages for OpenAI-compatible API."""
+        """Format messages for OpenAI-compatible API.
+
+        Handles special internal roles:
+        - assistant messages with 'tool_calls' → assistant msg with tool_calls array
+        - 'tool_result' messages → one 'tool' message per result
+        """
         formatted = [{"role": "system", "content": system_msg}]
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+
+            # Assistant message that used tools
+            if role == "assistant" and msg.get("tool_calls"):
+                oai_tool_calls = []
+                for tc in msg["tool_calls"]:
+                    oai_tool_calls.append({
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc.get("arguments", {})),
+                        },
+                    })
+                formatted.append({
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": oai_tool_calls,
+                })
+                continue
+
+            # Tool results → one tool message per result
+            if role == "tool_result":
+                for tr in msg.get("tool_results", []):
+                    formatted.append({
+                        "role": "tool",
+                        "tool_call_id": tr["tool_use_id"],
+                        "content": tr.get("content", ""),
+                    })
+                continue
+
             if role not in ("system", "user", "assistant"):
                 role = "user"
             formatted.append({"role": role, "content": content})
@@ -333,24 +402,65 @@ class AgentBrain:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        iteration: int = 0,
+        max_tool_rounds: int = 10,
     ) -> dict:
-        """Generate a complete response with optional tool execution."""
-        max_iter = self.settings.get("agent.max_iterations", 25)
-        if iteration >= max_iter:
-            return {"content": "[Max iterations reached]", "model": "", "usage": {}}
+        """Generate a response with an agentic tool-calling loop.
 
+        If the LLM returns tool_calls, they are executed and the results are
+        fed back as properly formatted tool_result messages (Anthropic format
+        or OpenAI tool role).  The loop continues until the LLM produces a
+        text-only response or ``max_tool_rounds`` is exhausted.
+
+        Args:
+            messages: Conversation history (internal format).
+            memory_context: Injected memory text for the system prompt.
+            model: Explicit model override (provider/model or model id).
+            temperature: Sampling temperature override.
+            max_tokens: Max output tokens override.
+            max_tool_rounds: Maximum tool-call round-trips before stopping.
+        """
         temp = temperature or self.settings.get("agent.temperature", 0.7)
         max_tok = max_tokens or self.settings.get("agent.max_tokens", 4096)
         system_msg = self._build_system_message(memory_context)
 
         provider_name, model_id = self.router.resolve_model(model)
+        # Accumulate token usage across rounds
+        cumulative_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-        try:
-            start_time = time.time()
-            result = await self._call_provider(provider_name, model_id, messages, system_msg, temp, max_tok)
-            latency = (time.time() - start_time) * 1000
-            self.router.record_success(provider_name, latency, result.get("usage", {}).get("total_tokens", 0))
+        # Work on a copy so the caller's list is not mutated
+        loop_messages = list(messages)
+
+        for round_idx in range(max_tool_rounds + 1):
+            try:
+                start_time = time.time()
+                result = await self._call_provider(provider_name, model_id, loop_messages, system_msg, temp, max_tok)
+                latency = (time.time() - start_time) * 1000
+                self.router.record_success(provider_name, latency, result.get("usage", {}).get("total_tokens", 0))
+
+                # Accumulate usage
+                for k in cumulative_usage:
+                    cumulative_usage[k] += result.get("usage", {}).get(k, 0)
+
+            except Exception as e:
+                logger.error(f"Provider {provider_name} failed: {e}")
+                self.router.record_failure(provider_name)
+
+                # Try failover
+                failover = self.router.get_failover(provider_name, model_id)
+                if failover:
+                    fo_provider, fo_model = failover
+                    try:
+                        start_time = time.time()
+                        result = await self._call_provider(fo_provider, fo_model, loop_messages, system_msg, temp, max_tok)
+                        latency = (time.time() - start_time) * 1000
+                        self.router.record_success(fo_provider, latency)
+                        for k in cumulative_usage:
+                            cumulative_usage[k] += result.get("usage", {}).get(k, 0)
+                    except Exception as e2:
+                        logger.error(f"Failover to {fo_provider} also failed: {e2}")
+                        return {"content": f"Error: {str(e)}", "model": model_id, "usage": cumulative_usage, "tool_calls": []}
+                else:
+                    return {"content": f"Error: {str(e)}", "model": model_id, "usage": cumulative_usage, "tool_calls": []}
 
             # Extract and log thinking
             if self.settings.get("agent.chain_of_thought", True):
@@ -360,35 +470,43 @@ class AgentBrain:
                     result["thinking"] = thinking
                     result["content"] = clean_content
 
-            # Handle tool calls
-            if result.get("tool_calls") and self.tool_executor:
-                tool_results = await self._execute_tools(result["tool_calls"])
-                messages = messages + [
-                    {"role": "assistant", "content": result["content"]},
-                    {"role": "user", "content": f"Tool results:\n{json.dumps(tool_results, indent=2)}"},
-                ]
-                return await self.generate(messages, memory_context, model, temperature, max_tokens, iteration + 1)
+            # ── No tool calls → final answer ──
+            if not result.get("tool_calls") or not self.tool_executor:
+                result["usage"] = cumulative_usage
+                return result
 
-            return result
+            # ── Tool calls → execute and loop ──
+            if round_idx >= max_tool_rounds:
+                logger.warning(f"Max tool rounds ({max_tool_rounds}) reached")
+                result["usage"] = cumulative_usage
+                result["content"] = result.get("content", "") + "\n[Max tool rounds reached]"
+                return result
 
-        except Exception as e:
-            logger.error(f"Provider {provider_name} failed: {e}")
-            self.router.record_failure(provider_name)
+            tool_calls = result["tool_calls"]
+            tool_results = await self._execute_tools(tool_calls)
 
-            # Try failover
-            failover = self.router.get_failover(provider_name, model_id)
-            if failover:
-                fo_provider, fo_model = failover
-                try:
-                    start_time = time.time()
-                    result = await self._call_provider(fo_provider, fo_model, messages, system_msg, temp, max_tok)
-                    latency = (time.time() - start_time) * 1000
-                    self.router.record_success(fo_provider, latency)
-                    return result
-                except Exception as e2:
-                    logger.error(f"Failover to {fo_provider} also failed: {e2}")
+            # Append assistant message (with tool_calls metadata for formatting)
+            loop_messages.append({
+                "role": "assistant",
+                "content": result.get("content", ""),
+                "tool_calls": tool_calls,
+            })
 
-            return {"content": f"Error: {str(e)}", "model": model_id, "usage": {}, "tool_calls": []}
+            # Append tool_result message (proper Anthropic / OpenAI format)
+            tool_result_entries = []
+            for tc, tr in zip(tool_calls, tool_results):
+                content_str = json.dumps(tr.get("result", tr.get("error", "")), default=str)
+                tool_result_entries.append({
+                    "tool_use_id": tc["id"],
+                    "content": content_str,
+                })
+            loop_messages.append({
+                "role": "tool_result",
+                "tool_results": tool_result_entries,
+            })
+
+        # Should not reach here, but safety net
+        return {"content": "[Max tool rounds reached]", "model": model_id, "usage": cumulative_usage, "tool_calls": []}
 
     async def generate_stream(
         self,
