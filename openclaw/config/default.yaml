@@ -31,7 +31,7 @@ gateway:
     max_entries: 1000
     ttl_seconds: 3600
   security:
-    api_key_required: false
+    api_key_required: true
     api_keys: []
     content_filtering: true
     pii_detection: false

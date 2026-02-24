@@ -16,6 +16,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPExcept
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse as StarletteJSONResponse
 
 from openclaw.config.settings import get_settings
 from openclaw.gateway.middleware import RateLimiter, SecurityMiddleware, SemanticCache
@@ -162,6 +164,37 @@ class ConnectionManager:
         return len(self.active_connections)
 
 
+# ── API Key Middleware ────────────────────────────────────────────────
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Enforce X-API-Key header on all /api/* routes when api_key_required is true."""
+
+    def __init__(self, app, settings=None):
+        super().__init__(app)
+        self._settings = settings
+
+    async def dispatch(self, request, call_next):
+        # Only protect /api/* routes; /health, static, websocket are exempt
+        if not request.url.path.startswith("/api/"):
+            return await call_next(request)
+
+        # Allow CORS preflight
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        settings = self._settings or get_settings()
+        if settings.get("gateway.security.api_key_required", False):
+            api_key = request.headers.get("x-api-key", "")
+            valid_keys = settings.get("gateway.security.api_keys", [])
+            if api_key not in valid_keys:
+                return StarletteJSONResponse(
+                    status_code=401,
+                    content={"error": "Invalid or missing API key"},
+                )
+
+        return await call_next(request)
+
+
 # ── Gateway Server ───────────────────────────────────────────────────
 
 class GatewayServer:
@@ -223,6 +256,8 @@ class GatewayServer:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+        # API key enforcement (outermost — runs before CORS)
+        self.app.add_middleware(APIKeyMiddleware, settings=self.settings)
 
     def _setup_routes(self):
         """Register all API routes."""
