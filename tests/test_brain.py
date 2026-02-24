@@ -926,3 +926,353 @@ class TestProviderClient:
     def test_get_provider_unknown_raises(self, brain):
         with pytest.raises(ValueError, match="Unknown provider"):
             brain._get_provider_client("notexist")
+
+
+# ══════════════════════════════════════════════════════════════
+#  STREAMING WITH TOOL_USE SUPPORT
+# ══════════════════════════════════════════════════════════════
+
+
+# ── Mock helpers for Anthropic streaming events ──────────────
+
+class _StreamEvent:
+    """Fake Anthropic raw stream event."""
+    def __init__(self, event_type, **kwargs):
+        self.type = event_type
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class _ContentBlock:
+    def __init__(self, block_type, **kwargs):
+        self.type = block_type
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class _Delta:
+    def __init__(self, delta_type, **kwargs):
+        self.type = delta_type
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class _MockMessageStream:
+    """Mock for ``client.messages.stream()`` async context manager."""
+    def __init__(self, events):
+        self._events = events
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def __aiter__(self):
+        return self._aiter()
+
+    async def _aiter(self):
+        for event in self._events:
+            yield event
+
+
+def _make_text_stream_events(text):
+    """Build stream events for a text-only Anthropic response."""
+    return [
+        _StreamEvent("content_block_start", content_block=_ContentBlock("text")),
+        _StreamEvent("content_block_delta", delta=_Delta("text_delta", text=text)),
+        _StreamEvent("content_block_stop"),
+        _StreamEvent("message_stop"),
+    ]
+
+
+def _make_tool_stream_events(text, tool_calls):
+    """Build stream events for an Anthropic response with text + tool_use blocks."""
+    events = []
+    if text:
+        events.append(_StreamEvent("content_block_start", content_block=_ContentBlock("text")))
+        events.append(_StreamEvent("content_block_delta", delta=_Delta("text_delta", text=text)))
+        events.append(_StreamEvent("content_block_stop"))
+    for tc in tool_calls:
+        events.append(_StreamEvent(
+            "content_block_start",
+            content_block=_ContentBlock("tool_use", id=tc["id"], name=tc["name"]),
+        ))
+        json_str = json.dumps(tc.get("arguments", tc.get("input", {})))
+        events.append(_StreamEvent(
+            "content_block_delta",
+            delta=_Delta("input_json_delta", partial_json=json_str),
+        ))
+        events.append(_StreamEvent("content_block_stop"))
+    events.append(_StreamEvent("message_stop"))
+    return events
+
+
+class TestStreamAnthropicEvents:
+    """Tests for _stream_anthropic() structured event yielding."""
+
+    @pytest.mark.asyncio
+    async def test_text_only(self, brain):
+        """Text-only stream yields text events, no tool_calls."""
+        events = _make_text_stream_events("Hello world")
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            collected = []
+            async for event in brain._stream_anthropic(
+                "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096
+            ):
+                collected.append(event)
+
+        assert len(collected) == 1
+        assert collected[0] == {"type": "text", "content": "Hello world"}
+
+    @pytest.mark.asyncio
+    async def test_with_tool_calls(self, brain):
+        """Stream with tool_use blocks yields text + tool_calls event."""
+        events = _make_tool_stream_events("Searching.", [
+            {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
+        ])
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            collected = []
+            async for event in brain._stream_anthropic(
+                "model", [{"role": "user", "content": "ls"}], "sys", 0.7, 4096
+            ):
+                collected.append(event)
+
+        text_events = [e for e in collected if e["type"] == "text"]
+        tool_events = [e for e in collected if e["type"] == "tool_calls"]
+        assert len(text_events) == 1
+        assert text_events[0]["content"] == "Searching."
+        assert len(tool_events) == 1
+        assert tool_events[0]["tool_calls"][0]["name"] == "shell"
+        assert tool_events[0]["tool_calls"][0]["arguments"] == {"command": "ls"}
+
+    @pytest.mark.asyncio
+    async def test_partial_json_accumulated(self, brain):
+        """Multiple input_json_delta chunks are accumulated correctly."""
+        events = [
+            _StreamEvent("content_block_start",
+                content_block=_ContentBlock("tool_use", id="tu_1", name="shell")),
+            _StreamEvent("content_block_delta",
+                delta=_Delta("input_json_delta", partial_json='{"com')),
+            _StreamEvent("content_block_delta",
+                delta=_Delta("input_json_delta", partial_json='mand":')),
+            _StreamEvent("content_block_delta",
+                delta=_Delta("input_json_delta", partial_json=' "ls -la"}')),
+            _StreamEvent("content_block_stop"),
+            _StreamEvent("message_stop"),
+        ]
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            collected = []
+            async for event in brain._stream_anthropic(
+                "model", [{"role": "user", "content": "ls"}], "sys", 0.7, 4096
+            ):
+                collected.append(event)
+
+        assert len(collected) == 1
+        assert collected[0]["type"] == "tool_calls"
+        assert collected[0]["tool_calls"][0]["arguments"] == {"command": "ls -la"}
+
+    @pytest.mark.asyncio
+    async def test_multiple_tools_in_one_response(self, brain):
+        """Two tool_use blocks in one stream are both accumulated."""
+        events = _make_tool_stream_events("Checking.", [
+            {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
+            {"id": "tu_2", "name": "read_file", "arguments": {"path": "/tmp/x"}},
+        ])
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            collected = []
+            async for event in brain._stream_anthropic(
+                "model", [{"role": "user", "content": "go"}], "sys", 0.7, 4096
+            ):
+                collected.append(event)
+
+        tool_event = [e for e in collected if e["type"] == "tool_calls"][0]
+        assert len(tool_event["tool_calls"]) == 2
+        assert tool_event["tool_calls"][0]["name"] == "shell"
+        assert tool_event["tool_calls"][1]["name"] == "read_file"
+
+    @pytest.mark.asyncio
+    async def test_injects_tool_definitions(self, brain):
+        """When tool_executor is present, tools kwarg is passed to the stream."""
+        events = _make_text_stream_events("ok")
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            async for _ in brain._stream_anthropic(
+                "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096
+            ):
+                pass
+
+        call_kwargs = mock_client.messages.stream.call_args.kwargs
+        assert "tools" in call_kwargs
+        assert any(t["name"] == "shell" for t in call_kwargs["tools"])
+
+
+class TestGenerateStreamWithTools:
+    """Tests for generate_stream_with_tools() agentic streaming loop."""
+
+    @pytest.mark.asyncio
+    async def test_text_only_no_loop(self, brain):
+        """When no tool_calls, just yields text and returns."""
+        events = _make_text_stream_events("Hello!")
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            chunks = []
+            async for chunk in brain.generate_stream_with_tools(
+                [{"role": "user", "content": "hi"}]
+            ):
+                chunks.append(chunk)
+
+        assert "".join(chunks) == "Hello!"
+
+    @pytest.mark.asyncio
+    async def test_executes_tools_and_restreams(self, brain, tool_executor):
+        """Tool calls -> execute -> re-stream -> final text."""
+        events_r1 = _make_tool_stream_events("Let me check.", [
+            {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
+        ])
+        events_r2 = _make_text_stream_events("Here are the files.")
+
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(
+            side_effect=[_MockMessageStream(events_r1), _MockMessageStream(events_r2)]
+        )
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            chunks = []
+            async for chunk in brain.generate_stream_with_tools(
+                [{"role": "user", "content": "list files"}]
+            ):
+                chunks.append(chunk)
+
+        full = "".join(chunks)
+        assert "Let me check." in full
+        assert "\n[TOOL_EXECUTING: shell]\n" in full
+        assert "Here are the files." in full
+        tool_executor.execute.assert_called_once_with("shell", {"command": "ls"})
+
+    @pytest.mark.asyncio
+    async def test_max_tool_rounds_stops(self, brain, tool_executor):
+        """Stops at max_tool_rounds with warning marker."""
+        tool_events = _make_tool_stream_events("Calling.", [
+            {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
+        ])
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(
+            side_effect=lambda **kw: _MockMessageStream(tool_events)
+        )
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            chunks = []
+            async for chunk in brain.generate_stream_with_tools(
+                [{"role": "user", "content": "loop"}],
+                max_tool_rounds=1,
+            ):
+                chunks.append(chunk)
+
+        full = "".join(chunks)
+        assert "[Max tool rounds reached]" in full
+        # Round 0: stream + tool call + execute; Round 1: stream + tool call + stop
+        assert mock_client.messages.stream.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_tool_results_passed_in_next_round(self, brain, tool_executor):
+        """After tool execution, next stream call includes tool_result messages."""
+        events_r1 = _make_tool_stream_events("Running.", [
+            {"id": "tu_1", "name": "shell", "arguments": {"command": "pwd"}},
+        ])
+        events_r2 = _make_text_stream_events("Done.")
+
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(
+            side_effect=[_MockMessageStream(events_r1), _MockMessageStream(events_r2)]
+        )
+        tool_executor.execute = AsyncMock(return_value={"stdout": "/home"})
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            async for _ in brain.generate_stream_with_tools(
+                [{"role": "user", "content": "where?"}]
+            ):
+                pass
+
+        # Second stream call should have more messages
+        second_kwargs = mock_client.messages.stream.call_args_list[1].kwargs
+        second_messages = second_kwargs["messages"]
+        # Last message should be a user message with tool_result blocks
+        last_msg = second_messages[-1]
+        assert last_msg["role"] == "user"
+        assert isinstance(last_msg["content"], list)
+        assert last_msg["content"][0]["type"] == "tool_result"
+        assert last_msg["content"][0]["tool_use_id"] == "tu_1"
+
+    @pytest.mark.asyncio
+    async def test_no_executor_skips_tool_loop(self, brain_no_tools):
+        """Without tool_executor, tool_calls are ignored (no loop)."""
+        events = _make_tool_stream_events("I would use a tool.", [
+            {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
+        ])
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain_no_tools, "_get_anthropic_client", return_value=mock_client):
+            chunks = []
+            async for chunk in brain_no_tools.generate_stream_with_tools(
+                [{"role": "user", "content": "hi"}]
+            ):
+                chunks.append(chunk)
+
+        assert "".join(chunks) == "I would use a tool."
+        assert mock_client.messages.stream.call_count == 1
+
+
+class TestGenerateStreamBackwardCompat:
+    """generate_stream() must still yield plain strings."""
+
+    @pytest.mark.asyncio
+    async def test_yields_plain_strings(self, brain):
+        events = _make_text_stream_events("Hi there!")
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            chunks = []
+            async for chunk in brain.generate_stream(
+                [{"role": "user", "content": "hi"}]
+            ):
+                chunks.append(chunk)
+
+        assert all(isinstance(c, str) for c in chunks)
+        assert "".join(chunks) == "Hi there!"
+
+    @pytest.mark.asyncio
+    async def test_ignores_tool_events(self, brain):
+        """generate_stream() silently drops tool_calls events."""
+        events = _make_tool_stream_events("Text part.", [
+            {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
+        ])
+        mock_client = MagicMock()
+        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+
+        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
+            chunks = []
+            async for chunk in brain.generate_stream(
+                [{"role": "user", "content": "hi"}]
+            ):
+                chunks.append(chunk)
+
+        assert "".join(chunks) == "Text part."
