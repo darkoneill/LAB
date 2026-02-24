@@ -549,7 +549,7 @@ class AgentBrain:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> AsyncGenerator[str, None]:
-        """Stream response tokens."""
+        """Stream response tokens (text only, no tool execution)."""
         temp = temperature or self.settings.get("agent.temperature", 0.7)
         max_tok = max_tokens or self.settings.get("agent.max_tokens", 4096)
         system_msg = self._build_system_message(memory_context)
@@ -557,14 +557,102 @@ class AgentBrain:
 
         try:
             if provider_name == "anthropic":
-                async for chunk in self._stream_anthropic(model_id, messages, system_msg, temp, max_tok):
-                    yield chunk
+                async for event in self._stream_anthropic(model_id, messages, system_msg, temp, max_tok):
+                    if isinstance(event, dict) and event.get("type") == "text":
+                        yield event["content"]
+                    # tool_calls events are silently dropped in text-only mode
             else:
                 async for chunk in self._stream_openai(provider_name, model_id, messages, system_msg, temp, max_tok):
                     yield chunk
         except Exception as e:
             logger.error(f"Streaming error with {provider_name}: {e}")
             yield f"\n[Error: {str(e)}]"
+
+    async def generate_stream_with_tools(
+        self,
+        messages: list[dict],
+        memory_context: str = "",
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        max_tool_rounds: int = 10,
+    ) -> AsyncGenerator[str, None]:
+        """Stream response with agentic tool execution.
+
+        Yields text tokens in real time.  When the model returns tool_use
+        blocks the method yields ``\\n[TOOL_EXECUTING: <name>]\\n`` markers,
+        executes the tools, injects the results into the conversation, and
+        starts a new stream.  Loops until the model produces a text-only
+        response or *max_tool_rounds* is reached.
+        """
+        temp = temperature or self.settings.get("agent.temperature", 0.7)
+        max_tok = max_tokens or self.settings.get("agent.max_tokens", 4096)
+        system_msg = self._build_system_message(memory_context)
+        provider_name, model_id = self.router.resolve_model(model)
+
+        loop_messages = list(messages)
+
+        for round_idx in range(max_tool_rounds + 1):
+            accumulated_text = ""
+            tool_calls: list[dict] = []
+
+            try:
+                if provider_name == "anthropic":
+                    async for event in self._stream_anthropic(
+                        model_id, loop_messages, system_msg, temp, max_tok
+                    ):
+                        if event.get("type") == "text":
+                            accumulated_text += event["content"]
+                            yield event["content"]
+                        elif event.get("type") == "tool_calls":
+                            tool_calls = event["tool_calls"]
+                else:
+                    # Non-Anthropic providers: text-only stream, no tool loop
+                    async for chunk in self._stream_openai(
+                        provider_name, model_id, loop_messages, system_msg, temp, max_tok
+                    ):
+                        yield chunk
+                    return
+            except Exception as e:
+                logger.error(f"Stream tool error on round {round_idx}: {e}")
+                yield f"\n[Error: {str(e)}]"
+                return
+
+            # No tool calls or no executor → done
+            if not tool_calls or not self.tool_executor:
+                return
+
+            if round_idx >= max_tool_rounds:
+                yield "\n[Max tool rounds reached]"
+                return
+
+            # Signal tool execution to the client
+            for tc in tool_calls:
+                yield f"\n[TOOL_EXECUTING: {tc['name']}]\n"
+
+            # Execute tools
+            tool_results = await self._execute_tools(tool_calls)
+
+            # Append assistant + tool_result messages for the next round
+            loop_messages.append({
+                "role": "assistant",
+                "content": accumulated_text,
+                "tool_calls": tool_calls,
+            })
+
+            tool_result_entries = []
+            for tc, tr in zip(tool_calls, tool_results):
+                content_str = json.dumps(
+                    tr.get("result", tr.get("error", "")), default=str
+                )
+                tool_result_entries.append({
+                    "tool_use_id": tc["id"],
+                    "content": content_str,
+                })
+            loop_messages.append({
+                "role": "tool_result",
+                "tool_results": tool_result_entries,
+            })
 
     # ── Provider dispatch (uses ProviderBase when available) ─
 
@@ -699,19 +787,63 @@ class AgentBrain:
     async def _stream_anthropic(
         self, model_id: str, messages: list[dict], system_msg: str,
         temperature: float, max_tokens: int
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[dict, None]:
+        """Stream Anthropic response, yielding structured events.
+
+        Yields:
+            ``{"type": "text", "content": str}``  for text deltas
+            ``{"type": "tool_calls", "tool_calls": list[dict]}``  at message_stop when
+            tool_use blocks were accumulated during the stream.
+        """
         client = self._get_anthropic_client()
         system, formatted = self._format_messages_anthropic(messages, system_msg)
 
-        async with client.messages.stream(
+        kwargs = dict(
             model=model_id,
             max_tokens=max_tokens,
             temperature=temperature,
             system=system,
             messages=formatted,
-        ) as stream:
-            async for text in stream.text_stream:
-                yield text
+        )
+
+        # Inject tool definitions so the model can return tool_use blocks
+        tools = self._get_tool_definitions_anthropic()
+        if tools and self.tool_executor:
+            kwargs["tools"] = tools
+
+        tool_calls: list[dict] = []
+        current_tool: dict | None = None
+
+        async with client.messages.stream(**kwargs) as stream:
+            async for event in stream:
+                if event.type == "content_block_start":
+                    if hasattr(event, "content_block") and event.content_block.type == "tool_use":
+                        current_tool = {
+                            "id": event.content_block.id,
+                            "name": event.content_block.name,
+                            "_json": "",
+                        }
+                elif event.type == "content_block_delta":
+                    if hasattr(event, "delta"):
+                        if event.delta.type == "text_delta":
+                            yield {"type": "text", "content": event.delta.text}
+                        elif event.delta.type == "input_json_delta" and current_tool is not None:
+                            current_tool["_json"] += event.delta.partial_json
+                elif event.type == "content_block_stop":
+                    if current_tool is not None:
+                        try:
+                            args = json.loads(current_tool["_json"]) if current_tool["_json"] else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        tool_calls.append({
+                            "id": current_tool["id"],
+                            "name": current_tool["name"],
+                            "arguments": args,
+                        })
+                        current_tool = None
+                elif event.type == "message_stop":
+                    if tool_calls:
+                        yield {"type": "tool_calls", "tool_calls": tool_calls}
 
     async def _stream_openai(
         self, provider_name: str, model_id: str, messages: list[dict],

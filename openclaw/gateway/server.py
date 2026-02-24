@@ -874,7 +874,7 @@ class GatewayServer:
             if memory_results:
                 memory_context = "\n".join([r.get("content", "") for r in memory_results])
 
-        async for chunk in self.agent.generate_stream(
+        async for chunk in self.agent.generate_stream_with_tools(
             messages=context_messages,
             memory_context=memory_context,
             model=request.model,
