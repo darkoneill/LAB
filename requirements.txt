@@ -31,6 +31,9 @@ aiofiles>=24.1.0
 # Sandbox (Docker isolation)
 docker>=7.0.0
 
+# Channels (Telegram)
+python-telegram-bot>=21.0
+
 # Utilities
 python-dateutil>=2.9.0
 uuid6>=2024.7.10
