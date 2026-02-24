@@ -8,6 +8,7 @@ import asyncio
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from rich.console import Console
@@ -62,6 +63,9 @@ class SetupWizard:
         base_dir = Path(__file__).parent
         self.settings = Settings.initialize(str(base_dir))
 
+        # Generate gateway API key if none exist
+        self._ensure_api_key()
+
         # Step 1: Welcome
         self._step_welcome()
 
@@ -78,6 +82,15 @@ class SetupWizard:
         self._step_done()
 
         return provider_ok
+
+    def _ensure_api_key(self):
+        """Generate and persist a gateway API key if none exist yet."""
+        existing_keys = self.settings.get("gateway.security.api_keys", [])
+        if existing_keys:
+            return
+        api_key = str(uuid.uuid4())
+        self.settings.set("gateway.security.api_keys", [api_key], persist=True)
+        self._generated_api_key = api_key
 
     def _show_progress(self, current: int):
         """Show wizard progress bar."""
@@ -389,6 +402,18 @@ Parle-moi simplement pour configurer :
             border_style="green",
             title="[bold green]Pret ![/bold green]",
         ))
+
+        if hasattr(self, "_generated_api_key"):
+            console.print()
+            console.print(Panel(
+                f"[bold]Cle API Gateway[/bold]\n\n"
+                f"[yellow]{self._generated_api_key}[/yellow]\n\n"
+                f"Utilise cette cle dans l'en-tete [cyan]X-API-Key[/cyan] pour acceder a l'API.\n"
+                f"Elle est sauvegardee dans [dim]config/user.yaml[/dim].",
+                border_style="yellow",
+                title="[bold yellow]Securite[/bold yellow]",
+            ))
+
         console.print()
         Prompt.ask("[dim]Appuie sur Entree pour demarrer OpenClaw[/dim]", default="")
 
