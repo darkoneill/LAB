@@ -117,6 +117,40 @@ async def run_gateway(components, settings):
     await gateway.start()
 
 
+async def _start_telegram(components, settings):
+    """Start the Telegram channel if enabled. Returns the channel or None."""
+    if not settings.get("channels.telegram.enabled", False):
+        return None
+    try:
+        from openclaw.channels.telegram import TelegramChannel
+        channel = TelegramChannel(
+            brain=components["agent_brain"],
+            memory_manager=components["memory_manager"],
+        )
+        await channel.start()
+        logging.getLogger("openclaw.init").info("Telegram channel started")
+        return channel
+    except Exception as e:
+        logging.getLogger("openclaw.init").error("Telegram channel failed to start: %s", e)
+        return None
+
+
+async def run_telegram(components, settings):
+    """Run only the Telegram bot (blocking)."""
+    channel = await _start_telegram(components, settings)
+    if not channel:
+        print("Telegram channel not enabled or failed to start. Check config.")
+        return
+    try:
+        # Block until interrupted
+        stop_event = asyncio.Event()
+        await stop_event.wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await channel.stop()
+
+
 async def run_both(components, settings):
     """Run both terminal and gateway concurrently."""
     gateway = GatewayServer(
@@ -129,6 +163,9 @@ async def run_both(components, settings):
     # Start background tasks (cleanup + scheduler)
     cleanup_task = asyncio.create_task(gateway._session_cleanup_loop())
     await gateway.scheduler.start()
+
+    # Start Telegram channel if enabled
+    telegram_channel = await _start_telegram(components, settings)
 
     # Start gateway in background
     import uvicorn
@@ -156,6 +193,8 @@ async def run_both(components, settings):
         await terminal.run()
     finally:
         server.should_exit = True
+        if telegram_channel:
+            await telegram_channel.stop()
         await gateway.scheduler.stop()
         cleanup_task.cancel()
         gateway_task.cancel()
@@ -193,11 +232,13 @@ async def main_async(args):
         await run_terminal(components)
     elif args.mode == "gateway":
         await run_gateway(components, settings)
+    elif args.mode == "telegram":
+        await run_telegram(components, settings)
     elif args.mode == "wizard":
         wizard = SetupWizard()
         await wizard.run()
     else:
-        # Default: both terminal + gateway
+        # Default: both terminal + gateway (+ telegram if enabled)
         await run_both(components, settings)
 
 
@@ -211,8 +252,8 @@ def main():
         "mode",
         nargs="?",
         default="both",
-        choices=["terminal", "gateway", "both", "wizard"],
-        help="Run mode: terminal (CLI only), gateway (API only), both (default), wizard (setup)",
+        choices=["terminal", "gateway", "telegram", "both", "wizard"],
+        help="Run mode: terminal, gateway, telegram, both (default), wizard",
     )
     parser.add_argument(
         "--no-wizard",

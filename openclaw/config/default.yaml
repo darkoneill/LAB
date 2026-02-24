@@ -190,6 +190,14 @@ tools:
     headless: true
     timeout_seconds: 30
 
+# --- Channels Configuration ---
+channels:
+  telegram:
+    enabled: false
+    token: ""
+    allowed_users: []  # deny-by-default (ZeroClaw pattern)
+    session_scope: "per_user"
+
 # --- UI Configuration ---
 ui:
   terminal:
