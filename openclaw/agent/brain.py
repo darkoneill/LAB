@@ -14,6 +14,8 @@ from typing import Optional, AsyncGenerator
 
 from openclaw.config.settings import get_settings
 from openclaw.gateway.router import RequestRouter
+from openclaw.providers.base import ProviderBase
+from openclaw.providers.factory import create_provider
 
 logger = logging.getLogger("openclaw.agent.brain")
 
@@ -55,18 +57,28 @@ class AgentBrain:
     - Manages conversation context
     - Supports streaming and multi-model
     - Handles tool calling natively
+
+    Accepts a ``provider`` (ProviderBase) via dependency injection.
+    When no provider is given the brain falls back to lazy creation
+    via the provider factory + settings.
     """
 
-    def __init__(self, tool_executor=None, skill_router=None):
+    def __init__(self, tool_executor=None, skill_router=None, provider: ProviderBase | None = None):
         self.settings = get_settings()
         self.router = RequestRouter()
         self.tool_executor = tool_executor
         self.skill_router = skill_router
+        self._provider = provider
+        self._providers: dict[str, ProviderBase] = {}
+        if provider is not None:
+            self._providers[provider.name] = provider
         self._system_prompt = ""
         self._personality = ""
         self._tools_prompt = ""
         self._load_prompts()
         self._tool_definitions = None  # cached tool defs
+
+    # ── Prompt loading ──────────────────────────────────────
 
     def _load_prompts(self):
         """Load prompt templates from files."""
@@ -107,6 +119,8 @@ class AgentBrain:
             parts.append(COT_INSTRUCTION)
 
         return "\n".join(parts)
+
+    # ── Tool definitions ────────────────────────────────────
 
     def _get_tool_definitions_anthropic(self) -> list[dict]:
         """Build Anthropic-format tool definitions from executor + skills."""
@@ -205,6 +219,8 @@ class AgentBrain:
             })
         return openai_tools
 
+    # ── CoT extraction ──────────────────────────────────────
+
     def _extract_thinking(self, content: str) -> tuple[str, str]:
         """Extract thinking blocks from response content.
 
@@ -234,8 +250,21 @@ class AgentBrain:
 
         return True
 
+    # ── Provider resolution ─────────────────────────────────
+
+    def _get_provider(self, provider_name: str) -> ProviderBase:
+        """Return a ProviderBase for *provider_name*, creating lazily if needed."""
+        if provider_name in self._providers:
+            return self._providers[provider_name]
+        provider = create_provider(provider_name, self.settings)
+        self._providers[provider_name] = provider
+        return provider
+
+    # Keep legacy helpers for backward compatibility with tests that
+    # patch ``_get_anthropic_client`` / ``_get_provider_client``.
+
     def _get_provider_client(self, provider_name: str):
-        """Get an LLM client for the specified provider."""
+        """Legacy: return raw SDK client. Prefer _get_provider()."""
         if provider_name == "anthropic":
             return self._get_anthropic_client()
         elif provider_name == "openai":
@@ -285,6 +314,8 @@ class AgentBrain:
             return openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
         except ImportError:
             raise RuntimeError("openai package not installed. Run: pip install openai")
+
+    # ── Message formatting ──────────────────────────────────
 
     def _format_messages_anthropic(self, messages: list[dict], system_msg: str) -> tuple[str, list[dict]]:
         """Format messages for Anthropic API.
@@ -394,6 +425,8 @@ class AgentBrain:
                 role = "user"
             formatted.append({"role": role, "content": content})
         return formatted
+
+    # ── Core generation ─────────────────────────────────────
 
     async def generate(
         self,
@@ -533,11 +566,33 @@ class AgentBrain:
             logger.error(f"Streaming error with {provider_name}: {e}")
             yield f"\n[Error: {str(e)}]"
 
+    # ── Provider dispatch (uses ProviderBase when available) ─
+
     async def _call_provider(
         self, provider_name: str, model_id: str, messages: list[dict],
         system_msg: str, temperature: float, max_tokens: int
     ) -> dict:
-        """Call a specific provider."""
+        """Call a specific provider.
+
+        Delegates to a ProviderBase instance when one is registered,
+        otherwise falls back to the legacy direct-client code path
+        (kept for backward compatibility with existing tests).
+        """
+        if provider_name in self._providers:
+            provider = self._providers[provider_name]
+            if provider_name == "anthropic":
+                system, formatted = self._format_messages_anthropic(messages, system_msg)
+                tools = self._get_tool_definitions_anthropic() if self.tool_executor else None
+                return await provider.generate(model_id, formatted, system, tools=tools, temperature=temperature, max_tokens=max_tokens)
+            else:
+                formatted = self._format_messages_openai(messages, system_msg)
+                tools = self._get_tool_definitions_openai() if self.tool_executor and provider.supports_tools else None
+                # OpenAIProvider.generate expects messages WITHOUT a prepended system message
+                # (it prepends one itself). Strip it to avoid duplication.
+                raw_formatted = formatted[1:] if formatted and formatted[0].get("role") == "system" else formatted
+                return await provider.generate(model_id, raw_formatted, system_msg, tools=tools, temperature=temperature, max_tokens=max_tokens)
+
+        # Legacy path — direct SDK clients (used by existing tests that patch _get_anthropic_client)
         if provider_name == "anthropic":
             return await self._call_anthropic(model_id, messages, system_msg, temperature, max_tokens)
         else:
@@ -676,6 +731,8 @@ class AgentBrain:
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+
+    # ── Tool execution ──────────────────────────────────────
 
     async def _execute_tools(self, tool_calls: list[dict]) -> list[dict]:
         """Execute tool calls and return results."""
