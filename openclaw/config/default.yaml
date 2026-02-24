@@ -125,8 +125,9 @@ memory:
       enabled: true
       interval_minutes: 60
       reflection_depth: 3
+  backend: "sqlite"  # "sqlite" (lightweight, ~50MB) or "chromadb" (vector, ~500MB)
   vector:
-    enabled: true
+    enabled: false
     collection: "openclaw_memory"
     embedding_provider: "sentence-transformers"  # sentence-transformers, openai, default
     model: "all-MiniLM-L6-v2"  # Fast, 384 dimensions

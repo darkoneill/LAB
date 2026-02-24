@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from openclaw.config.settings import get_settings
+from openclaw.memory.backends.base import MemoryBackend
 from .resource_layer import ResourceLayer
 from .item_layer import ItemLayer
 from .category_layer import CategoryLayer
@@ -29,7 +30,7 @@ class MemoryManager:
     Decides what to store, organize, link, evolve, and forget.
     """
 
-    def __init__(self):
+    def __init__(self, backend: MemoryBackend | None = None):
         self.settings = get_settings()
         self._base_path = self._resolve_store_path()
         self._base_path.mkdir(parents=True, exist_ok=True)
@@ -38,9 +39,34 @@ class MemoryManager:
         self.items = ItemLayer(self._base_path / "items")
         self.categories = CategoryLayer(self._base_path / "categories")
         self.retrieval = HybridRetrieval(self.items, self.categories)
+        self.backend: MemoryBackend = backend or self._create_backend()
 
         self._evolution_task: Optional[asyncio.Task] = None
         self._initialized = False
+
+    def _create_backend(self) -> MemoryBackend:
+        """Instantiate the configured memory backend.
+
+        Config: ``memory.backend`` — ``"sqlite"`` (default) or ``"chromadb"``.
+        Falls back to SQLite if ChromaDB is requested but unavailable.
+        """
+        choice = self.settings.get("memory.backend", "sqlite")
+
+        if choice == "chromadb" or (
+            choice != "sqlite"
+            and self.settings.get("memory.vector.enabled", False)
+        ):
+            try:
+                from openclaw.memory.backends.chromadb_backend import ChromaDBBackend
+                logger.info("Using ChromaDB memory backend")
+                return ChromaDBBackend()
+            except Exception as exc:
+                logger.warning(f"ChromaDB unavailable ({exc}), falling back to SQLite")
+
+        from openclaw.memory.backends.sqlite_backend import SQLiteBackend
+        db_path = self._base_path / "memories.db"
+        logger.info(f"Using SQLite FTS5 memory backend at {db_path}")
+        return SQLiteBackend(db_path)
 
     def _resolve_store_path(self) -> Path:
         store_path = self.settings.get("memory.store_path", "memory/store")
