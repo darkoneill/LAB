@@ -279,6 +279,12 @@ class GatewayServer:
                 memory_usage_mb=round(mem, 2),
             )
 
+        @self.app.get("/api/doctor")
+        async def doctor():
+            from openclaw.tools.doctor import run_diagnostics
+            report = run_diagnostics()
+            return report.to_dict()
+
         @self.app.get("/api/info")
         async def info():
             return {

@@ -169,6 +169,8 @@ skills:
 
 # --- Tools Configuration ---
 tools:
+  workspace_path: ""          # Default: current working directory
+  workspace_only: true        # Restrict file tools to workspace (ZeroClaw pattern)
   shell:
     enabled: true
     sandboxed: true

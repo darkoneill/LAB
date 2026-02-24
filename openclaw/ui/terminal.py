@@ -98,6 +98,7 @@ class TerminalUI:
 | `/tools` | Lister les outils |
 | `/clear` | Effacer l'ecran |
 | `/reset` | Reinitialiser la session |
+| `/doctor` | Diagnostics systeme |
 | `/wizard` | Relancer le wizard de configuration |
 | `/quit` | Quitter OpenClaw |
 
@@ -194,6 +195,8 @@ Parle-moi naturellement. Je suis ton assistant IA polyvalent.
             self._show_tools()
         elif cmd == "/config":
             await self._config_command(args)
+        elif cmd == "/doctor":
+            self._show_doctor()
         elif cmd == "/wizard":
             from openclaw.setup_wizard import SetupWizard
             wizard = SetupWizard()
@@ -365,3 +368,29 @@ Parle-moi naturellement. Je suis ton assistant IA polyvalent.
             else:
                 value = self.settings.get(args.strip())
                 self.console.print(f"[cyan]{args.strip()}[/cyan] = {value}")
+
+    def _show_doctor(self):
+        """Run diagnostics and display a Rich-formatted report."""
+        from openclaw.tools.doctor import run_diagnostics
+
+        report = run_diagnostics()
+
+        status_style = {"OK": "green", "WARN": "yellow", "FAIL": "red bold"}
+        status_icon = {"OK": "[green]OK[/green]", "WARN": "[yellow]WARN[/yellow]", "FAIL": "[red bold]FAIL[/red bold]"}
+
+        table = Table(title="Diagnostic Report", show_lines=True)
+        table.add_column("Check", style="cyan", min_width=12)
+        table.add_column("Status", justify="center", min_width=6)
+        table.add_column("Message")
+
+        for c in report.checks:
+            table.add_row(c.name, status_icon.get(c.status, c.status), c.message)
+
+        self.console.print()
+        self.console.print(table)
+
+        summary_style = "success" if report.healthy else "error"
+        self.console.print(
+            f"\n[{summary_style}]{report.ok_count} OK, {report.warn_count} WARN, {report.fail_count} FAIL[/{summary_style}]"
+        )
+        self.console.print()
