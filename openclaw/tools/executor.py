@@ -37,6 +37,15 @@ class ToolExecutor:
     def __init__(self):
         self.settings = get_settings()
         self._tools: dict[str, callable] = {}
+
+        # Workspace scoping
+        ws_path = self.settings.get("tools.workspace_path", "")
+        self._workspace_only: bool = self.settings.get("tools.workspace_only", True)
+        if ws_path:
+            self._workspace: _Path = _Path(ws_path).resolve()
+        else:
+            self._workspace: _Path = _Path.cwd().resolve()
+
         self._register_defaults()
 
     def _register_defaults(self):
@@ -83,21 +92,45 @@ class ToolExecutor:
 
     def _validate_path(self, path: str) -> tuple[bool, str]:
         """Validate a file path against security policies.
-        Returns (allowed, error_message)."""
+        Returns (allowed, error_message).
+
+        Security layers (evaluated in order):
+        1. Null-byte injection check
+        2. Symlink-aware canonical resolution via ``os.path.realpath``
+        3. Workspace scoping (if ``tools.workspace_only`` is true)
+        4. Config-driven blocked paths
+        5. Hardcoded sensitive paths / prefixes
+        """
+        # 1. Null bytes
+        if "\x00" in path:
+            return False, "Path contains null byte"
+
+        # 2. Resolve via realpath (follows symlinks to final target)
         try:
-            resolved = _Path(path).resolve()
+            real = os.path.realpath(path)
+            resolved = _Path(real).resolve()
         except (OSError, ValueError) as e:
             return False, f"Invalid path: {e}"
 
         resolved_str = str(resolved)
 
-        # Check blocked paths from config
+        # 3. Workspace scoping
+        if self._workspace_only:
+            try:
+                resolved.relative_to(self._workspace)
+            except ValueError:
+                return False, (
+                    f"Path outside workspace: {resolved_str} "
+                    f"(workspace: {self._workspace})"
+                )
+
+        # 4. Config-driven blocked paths
         blocked = self.settings.get("tools.file_manager.blocked_paths", [])
         for bp in blocked:
             if resolved_str == bp or resolved_str.startswith(bp + "/"):
                 return False, "Path blocked by security policy"
 
-        # Check hardcoded sensitive paths
+        # 5. Hardcoded sensitive paths
         for sp in _SENSITIVE_PATHS:
             if resolved_str == sp or resolved_str.startswith(sp + "/"):
                 return False, "Access to sensitive path denied"
