@@ -1,13 +1,13 @@
 """
 Tests for openclaw/agent/brain.py
-Mocks all LLM calls (Anthropic + OpenAI) with AsyncMock.
+Mocks ProviderBase instances (not raw SDK clients).
 Covers: system message, tool definitions, tool execution routing,
-        provider failover, tool_call parsing, CoT extraction, context trimming.
+        provider failover, tool_call parsing, CoT extraction, context trimming,
+        streaming with tool_use support.
 """
 
 import json
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -52,49 +52,71 @@ class FakeSettings:
         return self._data.get(dotpath, default)
 
 
-def _make_anthropic_response(text="Hello!", tool_use_blocks=None, input_tokens=10, output_tokens=20):
-    """Build a fake Anthropic messages.create() response."""
-    blocks = []
+# ── Mock provider helpers ────────────────────────────────────
+
+
+def _make_result(content="Hello!", tool_calls=None, input_tokens=10, output_tokens=20):
+    """Build a standard ProviderBase.generate() result dict."""
+    return {
+        "content": content,
+        "model": "mock-model",
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+        "tool_calls": tool_calls or [],
+    }
+
+
+def _mock_provider(name="anthropic", supports_tools=True):
+    """Create a mock ProviderBase with configurable generate()."""
+    p = MagicMock()
+    type(p).name = PropertyMock(return_value=name)
+    type(p).supports_tools = PropertyMock(return_value=supports_tools)
+    p.generate = AsyncMock(return_value=_make_result())
+    return p
+
+
+class _StreamMock:
+    """Mock for an async generator method (like provider.stream).
+
+    Records calls and returns pre-configured event sequences.
+    """
+    def __init__(self, *event_sequences):
+        self._sequences = list(event_sequences)
+        self._call_idx = 0
+        self.call_count = 0
+        self.call_args_list = []
+
+    def __call__(self, *args, **kwargs):
+        self.call_count += 1
+        self.call_args_list.append((args, kwargs))
+        events = self._sequences[self._call_idx % len(self._sequences)]
+        self._call_idx += 1
+        return self._aiter(events)
+
+    @staticmethod
+    async def _aiter(events):
+        for event in events:
+            yield event
+
+
+def _text_events(text):
+    """Build stream events for a text-only response."""
+    return [{"type": "text", "content": text}]
+
+
+def _tool_events(text, tool_calls):
+    """Build stream events for a response with text + tool_calls."""
+    events = []
     if text:
-        blocks.append(SimpleNamespace(type="text", text=text))
-    for tu in (tool_use_blocks or []):
-        blocks.append(SimpleNamespace(
-            type="tool_use",
-            id=tu["id"],
-            name=tu["name"],
-            input=tu.get("input", {}),
-        ))
-    return SimpleNamespace(
-        content=blocks,
-        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
-    )
+        events.append({"type": "text", "content": text})
+    events.append({"type": "tool_calls", "tool_calls": tool_calls})
+    return events
 
 
-def _make_openai_response(text="Hello!", tool_calls=None, prompt_tokens=10, completion_tokens=20):
-    """Build a fake OpenAI chat.completions.create() response."""
-    tc_objects = None
-    if tool_calls:
-        tc_objects = []
-        for tc in tool_calls:
-            tc_objects.append(SimpleNamespace(
-                id=tc["id"],
-                function=SimpleNamespace(
-                    name=tc["name"],
-                    arguments=tc.get("arguments", "{}"),
-                ),
-            ))
-    choice = SimpleNamespace(
-        message=SimpleNamespace(
-            content=text,
-            tool_calls=tc_objects,
-        ),
-    )
-    usage = SimpleNamespace(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=prompt_tokens + completion_tokens,
-    )
-    return SimpleNamespace(choices=[choice], usage=usage)
+# ── Fixtures ──────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -471,150 +493,130 @@ class TestThinkingExtraction:
 
 
 # ══════════════════════════════════════════════════════════════
-#  ANTHROPIC TOOL_CALL PARSING
+#  PROVIDER DISPATCH — generate via ProviderBase
 # ══════════════════════════════════════════════════════════════
 
 
-class TestAnthropicParsing:
+class TestCallProvider:
 
     @pytest.mark.asyncio
-    async def test_parse_text_only(self, brain):
-        resp = _make_anthropic_response(text="Hello world")
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=resp)
+    async def test_anthropic_text_only(self, brain):
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result("Hello world"))
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain._call_anthropic("claude-sonnet-4-20250514", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096)
-
+        result = await brain._call_provider(
+            "anthropic", "claude-sonnet-4-20250514",
+            [{"role": "user", "content": "hi"}], "sys", 0.7, 4096,
+        )
         assert result["content"] == "Hello world"
         assert result["tool_calls"] == []
         assert result["usage"]["total_tokens"] == 30
 
     @pytest.mark.asyncio
-    async def test_parse_tool_use_blocks(self, brain):
-        resp = _make_anthropic_response(
-            text="Let me search.",
-            tool_use_blocks=[
-                {"id": "tu_1", "name": "shell", "input": {"command": "ls -la"}},
-                {"id": "tu_2", "name": "read_file", "input": {"path": "/tmp/test"}},
+    async def test_anthropic_with_tool_calls(self, brain):
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result(
+            "Let me search.",
+            tool_calls=[
+                {"id": "tu_1", "name": "shell", "arguments": {"command": "ls -la"}},
+                {"id": "tu_2", "name": "read_file", "arguments": {"path": "/tmp/test"}},
             ],
+        ))
+        brain._providers["anthropic"] = provider
+
+        result = await brain._call_provider(
+            "anthropic", "claude-sonnet-4-20250514",
+            [{"role": "user", "content": "list files"}], "sys", 0.7, 4096,
         )
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=resp)
-
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain._call_anthropic("claude-sonnet-4-20250514", [{"role": "user", "content": "list files"}], "sys", 0.7, 4096)
-
         assert len(result["tool_calls"]) == 2
         assert result["tool_calls"][0]["name"] == "shell"
         assert result["tool_calls"][0]["arguments"]["command"] == "ls -la"
         assert result["tool_calls"][1]["name"] == "read_file"
 
     @pytest.mark.asyncio
-    async def test_passes_tools_when_executor_present(self, brain):
-        resp = _make_anthropic_response(text="ok")
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=resp)
+    async def test_anthropic_passes_tools(self, brain):
+        """When tool_executor is present, tools are passed to provider."""
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result())
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            await brain._call_anthropic("model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096)
-
-        call_kwargs = mock_client.messages.create.call_args.kwargs
+        await brain._call_provider(
+            "anthropic", "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096,
+        )
+        call_kwargs = provider.generate.call_args.kwargs
         assert "tools" in call_kwargs
         assert any(t["name"] == "shell" for t in call_kwargs["tools"])
 
     @pytest.mark.asyncio
-    async def test_no_tools_without_executor(self, brain_no_tools):
-        resp = _make_anthropic_response(text="ok")
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=resp)
+    async def test_anthropic_no_tools_without_executor(self, brain_no_tools):
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result())
+        brain_no_tools._providers["anthropic"] = provider
 
-        with patch.object(brain_no_tools, "_get_anthropic_client", return_value=mock_client):
-            await brain_no_tools._call_anthropic("model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096)
-
-        call_kwargs = mock_client.messages.create.call_args.kwargs
-        assert "tools" not in call_kwargs
-
-
-# ══════════════════════════════════════════════════════════════
-#  OPENAI TOOL_CALL PARSING
-# ══════════════════════════════════════════════════════════════
-
-
-class TestOpenAIParsing:
+        await brain_no_tools._call_provider(
+            "anthropic", "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096,
+        )
+        call_kwargs = provider.generate.call_args.kwargs
+        assert call_kwargs.get("tools") is None
 
     @pytest.mark.asyncio
-    async def test_parse_text_only(self, brain):
-        resp = _make_openai_response(text="Hello!")
-        mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=resp)
+    async def test_openai_text_only(self, brain):
+        provider = _mock_provider("openai")
+        provider.generate = AsyncMock(return_value=_make_result("Hello!"))
+        brain._providers["openai"] = provider
 
-        with patch.object(brain, "_get_provider_client", return_value=mock_client):
-            result = await brain._call_openai_compat("openai", "gpt-4o", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096)
-
+        result = await brain._call_provider(
+            "openai", "gpt-4o",
+            [{"role": "user", "content": "hi"}], "sys", 0.7, 4096,
+        )
         assert result["content"] == "Hello!"
         assert result["tool_calls"] == []
 
     @pytest.mark.asyncio
-    async def test_parse_tool_calls_json_args(self, brain):
-        resp = _make_openai_response(
-            text="",
-            tool_calls=[
-                {"id": "call_1", "name": "shell", "arguments": '{"command": "ls"}'},
-            ],
+    async def test_openai_with_tool_calls(self, brain):
+        provider = _mock_provider("openai")
+        provider.generate = AsyncMock(return_value=_make_result(
+            "",
+            tool_calls=[{"id": "call_1", "name": "shell", "arguments": {"command": "ls"}}],
+        ))
+        brain._providers["openai"] = provider
+
+        result = await brain._call_provider(
+            "openai", "gpt-4o",
+            [{"role": "user", "content": "list"}], "sys", 0.7, 4096,
         )
-        mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=resp)
-
-        with patch.object(brain, "_get_provider_client", return_value=mock_client):
-            result = await brain._call_openai_compat("openai", "gpt-4o", [{"role": "user", "content": "list"}], "sys", 0.7, 4096)
-
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["arguments"]["command"] == "ls"
 
     @pytest.mark.asyncio
-    async def test_parse_tool_calls_invalid_json_args(self, brain):
-        """If arguments is a non-JSON string, it should be wrapped as {"query": ...}."""
-        resp = _make_openai_response(
-            text="",
-            tool_calls=[
-                {"id": "call_1", "name": "skill_web_search", "arguments": "search for cats"},
-            ],
-        )
-        mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=resp)
-
-        with patch.object(brain, "_get_provider_client", return_value=mock_client):
-            result = await brain._call_openai_compat("openai", "gpt-4o", [{"role": "user", "content": "search"}], "sys", 0.7, 4096)
-
-        assert result["tool_calls"][0]["arguments"] == {"query": "search for cats"}
-
-    @pytest.mark.asyncio
-    async def test_no_tools_for_ollama(self, brain, fake_settings):
-        """Ollama provider should NOT receive tool definitions."""
+    async def test_ollama_no_tools(self, brain, fake_settings):
+        """Ollama provider (supports_tools=False) should not receive tool definitions."""
         fake_settings._data["providers.ollama.enabled"] = True
         fake_settings._data["providers.ollama.base_url"] = "http://localhost:11434"
 
-        resp = _make_openai_response(text="ok")
-        mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=resp)
+        provider = _mock_provider("ollama", supports_tools=False)
+        provider.generate = AsyncMock(return_value=_make_result("ok"))
+        brain._providers["ollama"] = provider
 
-        with patch.object(brain, "_get_provider_client", return_value=mock_client):
-            await brain._call_openai_compat("ollama", "llama3", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096)
-
-        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-        assert "tools" not in call_kwargs
+        await brain._call_provider(
+            "ollama", "llama3",
+            [{"role": "user", "content": "hi"}], "sys", 0.7, 4096,
+        )
+        call_kwargs = provider.generate.call_args.kwargs
+        assert call_kwargs.get("tools") is None
 
     @pytest.mark.asyncio
-    async def test_passes_tools_for_openai(self, brain):
-        resp = _make_openai_response(text="ok")
-        mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=resp)
+    async def test_openai_passes_tools(self, brain):
+        provider = _mock_provider("openai")
+        provider.generate = AsyncMock(return_value=_make_result("ok"))
+        brain._providers["openai"] = provider
 
-        with patch.object(brain, "_get_provider_client", return_value=mock_client):
-            await brain._call_openai_compat("openai", "gpt-4o", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096)
-
-        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        await brain._call_provider(
+            "openai", "gpt-4o",
+            [{"role": "user", "content": "hi"}], "sys", 0.7, 4096,
+        )
+        call_kwargs = provider.generate.call_args.kwargs
         assert "tools" in call_kwargs
         assert any(t["function"]["name"] == "shell" for t in call_kwargs["tools"])
 
@@ -682,132 +684,118 @@ class TestGenerate:
 
     @pytest.mark.asyncio
     async def test_generate_simple_text(self, brain):
-        resp = _make_anthropic_response(text="Hello user!")
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=resp)
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result("Hello user!"))
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain.generate([{"role": "user", "content": "hi"}])
-
+        result = await brain.generate([{"role": "user", "content": "hi"}])
         assert result["content"] == "Hello user!"
         assert result["usage"]["total_tokens"] == 30
 
     @pytest.mark.asyncio
     async def test_generate_with_thinking(self, brain):
-        resp = _make_anthropic_response(text="<thinking>This is safe.</thinking>Result here.")
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=resp)
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result(
+            "<thinking>This is safe.</thinking>Result here."
+        ))
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain.generate([{"role": "user", "content": "do something"}])
-
+        result = await brain.generate([{"role": "user", "content": "do something"}])
         assert result["content"] == "Result here."
         assert result["thinking"] == "This is safe."
 
     @pytest.mark.asyncio
     async def test_generate_tool_call_loop(self, brain, tool_executor):
         """When LLM returns tool_calls, brain should execute then re-call LLM."""
-        # First call: LLM returns a tool_use
-        resp_with_tool = _make_anthropic_response(
-            text="Let me run that.",
-            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
-        )
-        # Second call: LLM returns final text
-        resp_final = _make_anthropic_response(text="Here are the files.")
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(side_effect=[
+            _make_result(
+                "Let me run that.",
+                tool_calls=[{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+            ),
+            _make_result("Here are the files."),
+        ])
+        brain._providers["anthropic"] = provider
 
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=[resp_with_tool, resp_final])
-
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain.generate([{"role": "user", "content": "list files"}])
-
+        result = await brain.generate([{"role": "user", "content": "list files"}])
         assert result["content"] == "Here are the files."
-        assert mock_client.messages.create.call_count == 2
+        assert provider.generate.call_count == 2
         tool_executor.execute.assert_called_once_with("shell", {"command": "ls"})
 
     @pytest.mark.asyncio
     async def test_generate_max_tool_rounds_exhausted(self, brain, tool_executor):
         """When max_tool_rounds is reached, stop looping and return with warning."""
-        resp_with_tool = _make_anthropic_response(
-            text="Calling tool.",
-            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result(
+            "Calling tool.",
+            tool_calls=[{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
             input_tokens=5, output_tokens=10,
+        ))
+        brain._providers["anthropic"] = provider
+
+        result = await brain.generate(
+            [{"role": "user", "content": "loop forever"}],
+            max_tool_rounds=1,
         )
-        mock_client = MagicMock()
-        # Always returns tool_calls — never a text-only response
-        mock_client.messages.create = AsyncMock(return_value=resp_with_tool)
-
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain.generate(
-                [{"role": "user", "content": "loop forever"}],
-                max_tool_rounds=1,
-            )
-
         assert "[Max tool rounds reached]" in result["content"]
-        # Round 0: call LLM → tool_calls → execute → loop
-        # Round 1: call LLM → tool_calls → round_idx >= max_tool_rounds → stop
-        assert mock_client.messages.create.call_count == 2
+        assert provider.generate.call_count == 2
 
     @pytest.mark.asyncio
     async def test_generate_cumulative_usage(self, brain, tool_executor):
         """Usage tokens should accumulate across multiple rounds."""
-        resp_tool = _make_anthropic_response(
-            text="",
-            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
-            input_tokens=100, output_tokens=50,
-        )
-        resp_final = _make_anthropic_response(
-            text="Done.",
-            input_tokens=200, output_tokens=80,
-        )
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=[resp_tool, resp_final])
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(side_effect=[
+            _make_result(
+                "",
+                tool_calls=[{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+                input_tokens=100, output_tokens=50,
+            ),
+            _make_result("Done.", input_tokens=200, output_tokens=80),
+        ])
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain.generate([{"role": "user", "content": "go"}])
-
+        result = await brain.generate([{"role": "user", "content": "go"}])
         assert result["usage"]["input_tokens"] == 300
         assert result["usage"]["output_tokens"] == 130
         assert result["usage"]["total_tokens"] == 430
 
     @pytest.mark.asyncio
     async def test_generate_does_not_mutate_caller_messages(self, brain, tool_executor):
-        """The caller's message list must not be mutated by the agentic loop."""
-        resp_tool = _make_anthropic_response(
-            text="",
-            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
-        )
-        resp_final = _make_anthropic_response(text="Done.")
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=[resp_tool, resp_final])
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(side_effect=[
+            _make_result(
+                "",
+                tool_calls=[{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+            ),
+            _make_result("Done."),
+        ])
+        brain._providers["anthropic"] = provider
 
         original_messages = [{"role": "user", "content": "hi"}]
         original_len = len(original_messages)
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            await brain.generate(original_messages)
-
+        await brain.generate(original_messages)
         assert len(original_messages) == original_len
 
     @pytest.mark.asyncio
     async def test_generate_tool_results_passed_to_llm(self, brain, tool_executor):
         """Verify that tool_result messages are included when re-calling the LLM."""
-        resp_tool = _make_anthropic_response(
-            text="Running.",
-            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "pwd"}}],
-        )
-        resp_final = _make_anthropic_response(text="You are in /home.")
-
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=[resp_tool, resp_final])
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(side_effect=[
+            _make_result(
+                "Running.",
+                tool_calls=[{"id": "tu_1", "name": "shell", "arguments": {"command": "pwd"}}],
+            ),
+            _make_result("You are in /home."),
+        ])
+        brain._providers["anthropic"] = provider
         tool_executor.execute = AsyncMock(return_value={"stdout": "/home"})
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            await brain.generate([{"role": "user", "content": "where am I?"}])
+        await brain.generate([{"role": "user", "content": "where am I?"}])
 
         # Second call should have more messages (assistant + tool_result appended)
-        second_call_kwargs = mock_client.messages.create.call_args_list[1].kwargs
-        second_messages = second_call_kwargs["messages"]
+        second_call_args = provider.generate.call_args_list[1]
+        second_messages = second_call_args[0][1]  # positional arg: messages
         # Should contain: user, assistant(tool_use blocks), user(tool_result blocks)
         assert len(second_messages) >= 3
         # Last message should be a user message with tool_result content blocks
@@ -820,28 +808,25 @@ class TestGenerate:
     @pytest.mark.asyncio
     async def test_generate_multi_round_loop(self, brain, tool_executor):
         """Verify 3-round tool loop: tool → tool → text."""
-        resp_tool_1 = _make_anthropic_response(
-            text="Step 1",
-            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
-            input_tokens=10, output_tokens=5,
-        )
-        resp_tool_2 = _make_anthropic_response(
-            text="Step 2",
-            tool_use_blocks=[{"id": "tu_2", "name": "read_file", "input": {"path": "/tmp/x"}}],
-            input_tokens=20, output_tokens=10,
-        )
-        resp_final = _make_anthropic_response(
-            text="All done.",
-            input_tokens=30, output_tokens=15,
-        )
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=[resp_tool_1, resp_tool_2, resp_final])
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(side_effect=[
+            _make_result(
+                "Step 1",
+                tool_calls=[{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+                input_tokens=10, output_tokens=5,
+            ),
+            _make_result(
+                "Step 2",
+                tool_calls=[{"id": "tu_2", "name": "read_file", "arguments": {"path": "/tmp/x"}}],
+                input_tokens=20, output_tokens=10,
+            ),
+            _make_result("All done.", input_tokens=30, output_tokens=15),
+        ])
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            result = await brain.generate([{"role": "user", "content": "do it all"}])
-
+        result = await brain.generate([{"role": "user", "content": "do it all"}])
         assert result["content"] == "All done."
-        assert mock_client.messages.create.call_count == 3
+        assert provider.generate.call_count == 3
         assert tool_executor.execute.call_count == 2
         assert result["usage"]["input_tokens"] == 60
         assert result["usage"]["output_tokens"] == 30
@@ -849,181 +834,67 @@ class TestGenerate:
     @pytest.mark.asyncio
     async def test_generate_no_tool_executor_skips_loop(self, brain_no_tools):
         """Without tool_executor, tool_calls in response are returned as-is (no loop)."""
-        resp = _make_anthropic_response(
-            text="I would call a tool.",
-            tool_use_blocks=[{"id": "tu_1", "name": "shell", "input": {"command": "ls"}}],
-        )
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=resp)
+        provider = _mock_provider("anthropic")
+        provider.generate = AsyncMock(return_value=_make_result(
+            "I would call a tool.",
+            tool_calls=[{"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}}],
+        ))
+        brain_no_tools._providers["anthropic"] = provider
 
-        with patch.object(brain_no_tools, "_get_anthropic_client", return_value=mock_client):
-            result = await brain_no_tools.generate([{"role": "user", "content": "hi"}])
-
-        # Should return immediately without executing tools
-        assert mock_client.messages.create.call_count == 1
+        result = await brain_no_tools.generate([{"role": "user", "content": "hi"}])
+        assert provider.generate.call_count == 1
         assert result["content"] == "I would call a tool."
 
     @pytest.mark.asyncio
     async def test_generate_failover(self, brain):
         """If primary provider fails, should failover to secondary."""
-        mock_anthropic = MagicMock()
-        mock_anthropic.messages.create = AsyncMock(side_effect=RuntimeError("anthropic down"))
+        provider_anthropic = _mock_provider("anthropic")
+        provider_anthropic.generate = AsyncMock(side_effect=RuntimeError("anthropic down"))
+        brain._providers["anthropic"] = provider_anthropic
 
-        resp_openai = _make_openai_response(text="Failover response")
-        mock_openai = MagicMock()
-        mock_openai.chat.completions.create = AsyncMock(return_value=resp_openai)
+        provider_openai = _mock_provider("openai")
+        provider_openai.generate = AsyncMock(return_value=_make_result("Failover response"))
+        brain._providers["openai"] = provider_openai
 
-        def get_provider(name):
-            if name == "openai":
-                return mock_openai
-            raise ValueError(f"unknown: {name}")
-
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_anthropic), \
-             patch.object(brain, "_get_provider_client", side_effect=get_provider):
-            result = await brain.generate([{"role": "user", "content": "hi"}])
-
+        result = await brain.generate([{"role": "user", "content": "hi"}])
         assert result["content"] == "Failover response"
 
     @pytest.mark.asyncio
     async def test_generate_all_providers_fail(self, brain):
         """If all providers fail, should return error message."""
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(side_effect=RuntimeError("all down"))
+        provider_anthropic = _mock_provider("anthropic")
+        provider_anthropic.generate = AsyncMock(side_effect=RuntimeError("all down"))
+        brain._providers["anthropic"] = provider_anthropic
 
-        mock_openai = MagicMock()
-        mock_openai.chat.completions.create = AsyncMock(side_effect=RuntimeError("openai too"))
+        provider_openai = _mock_provider("openai")
+        provider_openai.generate = AsyncMock(side_effect=RuntimeError("openai too"))
+        brain._providers["openai"] = provider_openai
 
-        def get_provider(name):
-            if name == "openai":
-                return mock_openai
-            raise ValueError(f"unknown: {name}")
-
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client), \
-             patch.object(brain, "_get_provider_client", side_effect=get_provider):
-            result = await brain.generate([{"role": "user", "content": "hi"}])
-
+        result = await brain.generate([{"role": "user", "content": "hi"}])
         assert "Error" in result["content"]
         assert result["tool_calls"] == []
 
 
 # ══════════════════════════════════════════════════════════════
-#  PROVIDER CLIENT RESOLUTION
+#  STREAMING WITH TOOL_USE SUPPORT (via ProviderBase.stream)
 # ══════════════════════════════════════════════════════════════
 
 
-class TestProviderClient:
-
-    def test_get_provider_anthropic(self, brain):
-        with patch.object(brain, "_get_anthropic_client", return_value="mock_anthropic"):
-            result = brain._get_provider_client("anthropic")
-        assert result == "mock_anthropic"
-
-    def test_get_provider_openai(self, brain):
-        with patch.object(brain, "_get_openai_client", return_value="mock_openai"):
-            result = brain._get_provider_client("openai")
-        assert result == "mock_openai"
-
-    def test_get_provider_unknown_raises(self, brain):
-        with pytest.raises(ValueError, match="Unknown provider"):
-            brain._get_provider_client("notexist")
-
-
-# ══════════════════════════════════════════════════════════════
-#  STREAMING WITH TOOL_USE SUPPORT
-# ══════════════════════════════════════════════════════════════
-
-
-# ── Mock helpers for Anthropic streaming events ──────────────
-
-class _StreamEvent:
-    """Fake Anthropic raw stream event."""
-    def __init__(self, event_type, **kwargs):
-        self.type = event_type
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-
-class _ContentBlock:
-    def __init__(self, block_type, **kwargs):
-        self.type = block_type
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-
-class _Delta:
-    def __init__(self, delta_type, **kwargs):
-        self.type = delta_type
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-
-class _MockMessageStream:
-    """Mock for ``client.messages.stream()`` async context manager."""
-    def __init__(self, events):
-        self._events = events
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        pass
-
-    def __aiter__(self):
-        return self._aiter()
-
-    async def _aiter(self):
-        for event in self._events:
-            yield event
-
-
-def _make_text_stream_events(text):
-    """Build stream events for a text-only Anthropic response."""
-    return [
-        _StreamEvent("content_block_start", content_block=_ContentBlock("text")),
-        _StreamEvent("content_block_delta", delta=_Delta("text_delta", text=text)),
-        _StreamEvent("content_block_stop"),
-        _StreamEvent("message_stop"),
-    ]
-
-
-def _make_tool_stream_events(text, tool_calls):
-    """Build stream events for an Anthropic response with text + tool_use blocks."""
-    events = []
-    if text:
-        events.append(_StreamEvent("content_block_start", content_block=_ContentBlock("text")))
-        events.append(_StreamEvent("content_block_delta", delta=_Delta("text_delta", text=text)))
-        events.append(_StreamEvent("content_block_stop"))
-    for tc in tool_calls:
-        events.append(_StreamEvent(
-            "content_block_start",
-            content_block=_ContentBlock("tool_use", id=tc["id"], name=tc["name"]),
-        ))
-        json_str = json.dumps(tc.get("arguments", tc.get("input", {})))
-        events.append(_StreamEvent(
-            "content_block_delta",
-            delta=_Delta("input_json_delta", partial_json=json_str),
-        ))
-        events.append(_StreamEvent("content_block_stop"))
-    events.append(_StreamEvent("message_stop"))
-    return events
-
-
-class TestStreamAnthropicEvents:
-    """Tests for _stream_anthropic() structured event yielding."""
+class TestStreamProvider:
+    """Tests for _stream_provider() structured event yielding."""
 
     @pytest.mark.asyncio
     async def test_text_only(self, brain):
         """Text-only stream yields text events, no tool_calls."""
-        events = _make_text_stream_events("Hello world")
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(_text_events("Hello world"))
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            collected = []
-            async for event in brain._stream_anthropic(
-                "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096
-            ):
-                collected.append(event)
+        collected = []
+        async for event in brain._stream_provider(
+            "anthropic", "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096
+        ):
+            collected.append(event)
 
         assert len(collected) == 1
         assert collected[0] == {"type": "text", "content": "Hello world"}
@@ -1031,72 +902,43 @@ class TestStreamAnthropicEvents:
     @pytest.mark.asyncio
     async def test_with_tool_calls(self, brain):
         """Stream with tool_use blocks yields text + tool_calls event."""
-        events = _make_tool_stream_events("Searching.", [
+        events = _tool_events("Searching.", [
             {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
         ])
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(events)
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            collected = []
-            async for event in brain._stream_anthropic(
-                "model", [{"role": "user", "content": "ls"}], "sys", 0.7, 4096
-            ):
-                collected.append(event)
+        collected = []
+        async for event in brain._stream_provider(
+            "anthropic", "model", [{"role": "user", "content": "ls"}], "sys", 0.7, 4096
+        ):
+            collected.append(event)
 
         text_events = [e for e in collected if e["type"] == "text"]
-        tool_events = [e for e in collected if e["type"] == "tool_calls"]
+        tool_call_events = [e for e in collected if e["type"] == "tool_calls"]
         assert len(text_events) == 1
         assert text_events[0]["content"] == "Searching."
-        assert len(tool_events) == 1
-        assert tool_events[0]["tool_calls"][0]["name"] == "shell"
-        assert tool_events[0]["tool_calls"][0]["arguments"] == {"command": "ls"}
-
-    @pytest.mark.asyncio
-    async def test_partial_json_accumulated(self, brain):
-        """Multiple input_json_delta chunks are accumulated correctly."""
-        events = [
-            _StreamEvent("content_block_start",
-                content_block=_ContentBlock("tool_use", id="tu_1", name="shell")),
-            _StreamEvent("content_block_delta",
-                delta=_Delta("input_json_delta", partial_json='{"com')),
-            _StreamEvent("content_block_delta",
-                delta=_Delta("input_json_delta", partial_json='mand":')),
-            _StreamEvent("content_block_delta",
-                delta=_Delta("input_json_delta", partial_json=' "ls -la"}')),
-            _StreamEvent("content_block_stop"),
-            _StreamEvent("message_stop"),
-        ]
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
-
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            collected = []
-            async for event in brain._stream_anthropic(
-                "model", [{"role": "user", "content": "ls"}], "sys", 0.7, 4096
-            ):
-                collected.append(event)
-
-        assert len(collected) == 1
-        assert collected[0]["type"] == "tool_calls"
-        assert collected[0]["tool_calls"][0]["arguments"] == {"command": "ls -la"}
+        assert len(tool_call_events) == 1
+        assert tool_call_events[0]["tool_calls"][0]["name"] == "shell"
+        assert tool_call_events[0]["tool_calls"][0]["arguments"] == {"command": "ls"}
 
     @pytest.mark.asyncio
     async def test_multiple_tools_in_one_response(self, brain):
-        """Two tool_use blocks in one stream are both accumulated."""
-        events = _make_tool_stream_events("Checking.", [
+        """Two tool_use blocks in one stream are both returned."""
+        events = _tool_events("Checking.", [
             {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
             {"id": "tu_2", "name": "read_file", "arguments": {"path": "/tmp/x"}},
         ])
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(events)
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            collected = []
-            async for event in brain._stream_anthropic(
-                "model", [{"role": "user", "content": "go"}], "sys", 0.7, 4096
-            ):
-                collected.append(event)
+        collected = []
+        async for event in brain._stream_provider(
+            "anthropic", "model", [{"role": "user", "content": "go"}], "sys", 0.7, 4096
+        ):
+            collected.append(event)
 
         tool_event = [e for e in collected if e["type"] == "tool_calls"][0]
         assert len(tool_event["tool_calls"]) == 2
@@ -1104,19 +946,18 @@ class TestStreamAnthropicEvents:
         assert tool_event["tool_calls"][1]["name"] == "read_file"
 
     @pytest.mark.asyncio
-    async def test_injects_tool_definitions(self, brain):
-        """When tool_executor is present, tools kwarg is passed to the stream."""
-        events = _make_text_stream_events("ok")
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+    async def test_passes_tools_kwarg(self, brain):
+        """When tool_executor is present, tools kwarg is passed to stream."""
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(_text_events("ok"))
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            async for _ in brain._stream_anthropic(
-                "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096
-            ):
-                pass
+        async for _ in brain._stream_provider(
+            "anthropic", "model", [{"role": "user", "content": "hi"}], "sys", 0.7, 4096
+        ):
+            pass
 
-        call_kwargs = mock_client.messages.stream.call_args.kwargs
+        _args, call_kwargs = provider.stream.call_args_list[0]
         assert "tools" in call_kwargs
         assert any(t["name"] == "shell" for t in call_kwargs["tools"])
 
@@ -1127,38 +968,35 @@ class TestGenerateStreamWithTools:
     @pytest.mark.asyncio
     async def test_text_only_no_loop(self, brain):
         """When no tool_calls, just yields text and returns."""
-        events = _make_text_stream_events("Hello!")
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(_text_events("Hello!"))
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            chunks = []
-            async for chunk in brain.generate_stream_with_tools(
-                [{"role": "user", "content": "hi"}]
-            ):
-                chunks.append(chunk)
+        chunks = []
+        async for chunk in brain.generate_stream_with_tools(
+            [{"role": "user", "content": "hi"}]
+        ):
+            chunks.append(chunk)
 
         assert "".join(chunks) == "Hello!"
 
     @pytest.mark.asyncio
     async def test_executes_tools_and_restreams(self, brain, tool_executor):
         """Tool calls -> execute -> re-stream -> final text."""
-        events_r1 = _make_tool_stream_events("Let me check.", [
+        events_r1 = _tool_events("Let me check.", [
             {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
         ])
-        events_r2 = _make_text_stream_events("Here are the files.")
+        events_r2 = _text_events("Here are the files.")
 
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(
-            side_effect=[_MockMessageStream(events_r1), _MockMessageStream(events_r2)]
-        )
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(events_r1, events_r2)
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            chunks = []
-            async for chunk in brain.generate_stream_with_tools(
-                [{"role": "user", "content": "list files"}]
-            ):
-                chunks.append(chunk)
+        chunks = []
+        async for chunk in brain.generate_stream_with_tools(
+            [{"role": "user", "content": "list files"}]
+        ):
+            chunks.append(chunk)
 
         full = "".join(chunks)
         assert "Let me check." in full
@@ -1169,50 +1007,47 @@ class TestGenerateStreamWithTools:
     @pytest.mark.asyncio
     async def test_max_tool_rounds_stops(self, brain, tool_executor):
         """Stops at max_tool_rounds with warning marker."""
-        tool_events = _make_tool_stream_events("Calling.", [
+        tool_events_data = _tool_events("Calling.", [
             {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
         ])
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(
-            side_effect=lambda **kw: _MockMessageStream(tool_events)
-        )
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            chunks = []
-            async for chunk in brain.generate_stream_with_tools(
-                [{"role": "user", "content": "loop"}],
-                max_tool_rounds=1,
-            ):
-                chunks.append(chunk)
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(tool_events_data, tool_events_data)
+        brain._providers["anthropic"] = provider
+
+        chunks = []
+        async for chunk in brain.generate_stream_with_tools(
+            [{"role": "user", "content": "loop"}],
+            max_tool_rounds=1,
+        ):
+            chunks.append(chunk)
 
         full = "".join(chunks)
         assert "[Max tool rounds reached]" in full
-        # Round 0: stream + tool call + execute; Round 1: stream + tool call + stop
-        assert mock_client.messages.stream.call_count == 2
+        assert provider.stream.call_count == 2
 
     @pytest.mark.asyncio
     async def test_tool_results_passed_in_next_round(self, brain, tool_executor):
         """After tool execution, next stream call includes tool_result messages."""
-        events_r1 = _make_tool_stream_events("Running.", [
+        events_r1 = _tool_events("Running.", [
             {"id": "tu_1", "name": "shell", "arguments": {"command": "pwd"}},
         ])
-        events_r2 = _make_text_stream_events("Done.")
+        events_r2 = _text_events("Done.")
 
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(
-            side_effect=[_MockMessageStream(events_r1), _MockMessageStream(events_r2)]
-        )
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(events_r1, events_r2)
+        brain._providers["anthropic"] = provider
         tool_executor.execute = AsyncMock(return_value={"stdout": "/home"})
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            async for _ in brain.generate_stream_with_tools(
-                [{"role": "user", "content": "where?"}]
-            ):
-                pass
+        async for _ in brain.generate_stream_with_tools(
+            [{"role": "user", "content": "where?"}]
+        ):
+            pass
 
         # Second stream call should have more messages
-        second_kwargs = mock_client.messages.stream.call_args_list[1].kwargs
-        second_messages = second_kwargs["messages"]
+        second_args, second_kwargs = provider.stream.call_args_list[1]
+        # provider.stream(model_id, formatted, system, tools=..., ...)
+        second_messages = second_args[1]  # formatted messages
         # Last message should be a user message with tool_result blocks
         last_msg = second_messages[-1]
         assert last_msg["role"] == "user"
@@ -1223,21 +1058,21 @@ class TestGenerateStreamWithTools:
     @pytest.mark.asyncio
     async def test_no_executor_skips_tool_loop(self, brain_no_tools):
         """Without tool_executor, tool_calls are ignored (no loop)."""
-        events = _make_tool_stream_events("I would use a tool.", [
+        events = _tool_events("I would use a tool.", [
             {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
         ])
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(events)
+        brain_no_tools._providers["anthropic"] = provider
 
-        with patch.object(brain_no_tools, "_get_anthropic_client", return_value=mock_client):
-            chunks = []
-            async for chunk in brain_no_tools.generate_stream_with_tools(
-                [{"role": "user", "content": "hi"}]
-            ):
-                chunks.append(chunk)
+        chunks = []
+        async for chunk in brain_no_tools.generate_stream_with_tools(
+            [{"role": "user", "content": "hi"}]
+        ):
+            chunks.append(chunk)
 
         assert "".join(chunks) == "I would use a tool."
-        assert mock_client.messages.stream.call_count == 1
+        assert provider.stream.call_count == 1
 
 
 class TestGenerateStreamBackwardCompat:
@@ -1245,16 +1080,15 @@ class TestGenerateStreamBackwardCompat:
 
     @pytest.mark.asyncio
     async def test_yields_plain_strings(self, brain):
-        events = _make_text_stream_events("Hi there!")
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(_text_events("Hi there!"))
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            chunks = []
-            async for chunk in brain.generate_stream(
-                [{"role": "user", "content": "hi"}]
-            ):
-                chunks.append(chunk)
+        chunks = []
+        async for chunk in brain.generate_stream(
+            [{"role": "user", "content": "hi"}]
+        ):
+            chunks.append(chunk)
 
         assert all(isinstance(c, str) for c in chunks)
         assert "".join(chunks) == "Hi there!"
@@ -1262,17 +1096,17 @@ class TestGenerateStreamBackwardCompat:
     @pytest.mark.asyncio
     async def test_ignores_tool_events(self, brain):
         """generate_stream() silently drops tool_calls events."""
-        events = _make_tool_stream_events("Text part.", [
+        events = _tool_events("Text part.", [
             {"id": "tu_1", "name": "shell", "arguments": {"command": "ls"}},
         ])
-        mock_client = MagicMock()
-        mock_client.messages.stream = MagicMock(return_value=_MockMessageStream(events))
+        provider = _mock_provider("anthropic")
+        provider.stream = _StreamMock(events)
+        brain._providers["anthropic"] = provider
 
-        with patch.object(brain, "_get_anthropic_client", return_value=mock_client):
-            chunks = []
-            async for chunk in brain.generate_stream(
-                [{"role": "user", "content": "hi"}]
-            ):
-                chunks.append(chunk)
+        chunks = []
+        async for chunk in brain.generate_stream(
+            [{"role": "user", "content": "hi"}]
+        ):
+            chunks.append(chunk)
 
         assert "".join(chunks) == "Text part."

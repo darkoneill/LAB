@@ -3,6 +3,7 @@ Anthropic (Claude) provider — implements ProviderBase.
 Extracted from brain.py _call_anthropic / _stream_anthropic.
 """
 
+import json
 import logging
 import os
 from typing import AsyncGenerator
@@ -81,18 +82,53 @@ class AnthropicProvider(ProviderBase):
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[dict, None]:
+        """Yield structured events: text deltas and tool_calls."""
         client = self._get_client()
 
-        async with client.messages.stream(
+        kwargs = dict(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
             system=system,
             messages=messages,
-        ) as stream_ctx:
-            async for text in stream_ctx.text_stream:
-                yield text
+        )
+        if tools:
+            kwargs["tools"] = tools
+
+        tool_calls: list[dict] = []
+        current_tool: dict | None = None
+
+        async with client.messages.stream(**kwargs) as stream_ctx:
+            async for event in stream_ctx:
+                if event.type == "content_block_start":
+                    if hasattr(event, "content_block") and event.content_block.type == "tool_use":
+                        current_tool = {
+                            "id": event.content_block.id,
+                            "name": event.content_block.name,
+                            "_json": "",
+                        }
+                elif event.type == "content_block_delta":
+                    if hasattr(event, "delta"):
+                        if event.delta.type == "text_delta":
+                            yield {"type": "text", "content": event.delta.text}
+                        elif event.delta.type == "input_json_delta" and current_tool is not None:
+                            current_tool["_json"] += event.delta.partial_json
+                elif event.type == "content_block_stop":
+                    if current_tool is not None:
+                        try:
+                            args = json.loads(current_tool["_json"]) if current_tool["_json"] else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        tool_calls.append({
+                            "id": current_tool["id"],
+                            "name": current_tool["name"],
+                            "arguments": args,
+                        })
+                        current_tool = None
+                elif event.type == "message_stop":
+                    if tool_calls:
+                        yield {"type": "tool_calls", "tool_calls": tool_calls}
 
     def _get_client(self):
         if self._client is None:

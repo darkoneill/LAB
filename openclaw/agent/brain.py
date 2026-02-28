@@ -4,7 +4,6 @@ Multi-model, prompt-driven LLM layer inspired by AgentZero's architecture.
 Enhanced with Chain of Thought (CoT) reasoning for improved reliability.
 """
 
-import asyncio
 import json
 import logging
 import re
@@ -58,9 +57,8 @@ class AgentBrain:
     - Supports streaming and multi-model
     - Handles tool calling natively
 
-    Accepts a ``provider`` (ProviderBase) via dependency injection.
-    When no provider is given the brain falls back to lazy creation
-    via the provider factory + settings.
+    All LLM access goes through ProviderBase instances (created lazily
+    via the provider factory when not injected).
     """
 
     def __init__(self, tool_executor=None, skill_router=None, provider: ProviderBase | None = None):
@@ -68,7 +66,6 @@ class AgentBrain:
         self.router = RequestRouter()
         self.tool_executor = tool_executor
         self.skill_router = skill_router
-        self._provider = provider
         self._providers: dict[str, ProviderBase] = {}
         if provider is not None:
             self._providers[provider.name] = provider
@@ -260,61 +257,6 @@ class AgentBrain:
         self._providers[provider_name] = provider
         return provider
 
-    # Keep legacy helpers for backward compatibility with tests that
-    # patch ``_get_anthropic_client`` / ``_get_provider_client``.
-
-    def _get_provider_client(self, provider_name: str):
-        """Legacy: return raw SDK client. Prefer _get_provider()."""
-        if provider_name == "anthropic":
-            return self._get_anthropic_client()
-        elif provider_name == "openai":
-            return self._get_openai_client()
-        elif provider_name == "ollama":
-            return self._get_ollama_client()
-        elif provider_name == "custom":
-            return self._get_custom_client()
-        raise ValueError(f"Unknown provider: {provider_name}")
-
-    def _get_anthropic_client(self):
-        try:
-            import anthropic
-            api_key = self.settings.get("providers.anthropic.api_key", "")
-            if not api_key:
-                import os
-                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-            return anthropic.AsyncAnthropic(api_key=api_key)
-        except ImportError:
-            raise RuntimeError("anthropic package not installed. Run: pip install anthropic")
-
-    def _get_openai_client(self):
-        try:
-            import openai
-            api_key = self.settings.get("providers.openai.api_key", "")
-            if not api_key:
-                import os
-                api_key = os.environ.get("OPENAI_API_KEY", "")
-            base_url = self.settings.get("providers.openai.base_url", None) or None
-            return openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
-        except ImportError:
-            raise RuntimeError("openai package not installed. Run: pip install openai")
-
-    def _get_ollama_client(self):
-        try:
-            import openai
-            base_url = self.settings.get("providers.ollama.base_url", "http://localhost:11434")
-            return openai.AsyncOpenAI(api_key="ollama", base_url=f"{base_url}/v1")
-        except ImportError:
-            raise RuntimeError("openai package not installed. Run: pip install openai")
-
-    def _get_custom_client(self):
-        try:
-            import openai
-            base_url = self.settings.get("providers.custom.base_url", "")
-            api_key = self.settings.get("providers.custom.api_key", "")
-            return openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
-        except ImportError:
-            raise RuntimeError("openai package not installed. Run: pip install openai")
-
     # ── Message formatting ──────────────────────────────────
 
     def _format_messages_anthropic(self, messages: list[dict], system_msg: str) -> tuple[str, list[dict]]:
@@ -426,6 +368,42 @@ class AgentBrain:
             formatted.append({"role": role, "content": content})
         return formatted
 
+    # ── Provider dispatch ────────────────────────────────────
+
+    async def _call_provider(
+        self, provider_name: str, model_id: str, messages: list[dict],
+        system_msg: str, temperature: float, max_tokens: int
+    ) -> dict:
+        """Call provider.generate() with properly formatted messages."""
+        provider = self._get_provider(provider_name)
+        if provider_name == "anthropic":
+            system, formatted = self._format_messages_anthropic(messages, system_msg)
+            tools = self._get_tool_definitions_anthropic() if self.tool_executor else None
+            return await provider.generate(model_id, formatted, system, tools=tools, temperature=temperature, max_tokens=max_tokens)
+        else:
+            formatted = self._format_messages_openai(messages, system_msg)
+            tools = self._get_tool_definitions_openai() if self.tool_executor and provider.supports_tools else None
+            # Strip the system message since OpenAIProvider prepends its own
+            raw_formatted = formatted[1:] if formatted and formatted[0].get("role") == "system" else formatted
+            return await provider.generate(model_id, raw_formatted, system_msg, tools=tools, temperature=temperature, max_tokens=max_tokens)
+
+    async def _stream_provider(
+        self, provider_name: str, model_id: str, messages: list[dict],
+        system_msg: str, temperature: float, max_tokens: int
+    ) -> AsyncGenerator[dict, None]:
+        """Stream from provider, yielding structured events."""
+        provider = self._get_provider(provider_name)
+        if provider_name == "anthropic":
+            system, formatted = self._format_messages_anthropic(messages, system_msg)
+            tools = self._get_tool_definitions_anthropic() if self.tool_executor else None
+            async for event in provider.stream(model_id, formatted, system, tools=tools, temperature=temperature, max_tokens=max_tokens):
+                yield event
+        else:
+            formatted = self._format_messages_openai(messages, system_msg)
+            raw_formatted = formatted[1:] if formatted and formatted[0].get("role") == "system" else formatted
+            async for event in provider.stream(model_id, raw_formatted, system_msg, temperature=temperature, max_tokens=max_tokens):
+                yield event
+
     # ── Core generation ─────────────────────────────────────
 
     async def generate(
@@ -443,14 +421,6 @@ class AgentBrain:
         fed back as properly formatted tool_result messages (Anthropic format
         or OpenAI tool role).  The loop continues until the LLM produces a
         text-only response or ``max_tool_rounds`` is exhausted.
-
-        Args:
-            messages: Conversation history (internal format).
-            memory_context: Injected memory text for the system prompt.
-            model: Explicit model override (provider/model or model id).
-            temperature: Sampling temperature override.
-            max_tokens: Max output tokens override.
-            max_tool_rounds: Maximum tool-call round-trips before stopping.
         """
         temp = temperature or self.settings.get("agent.temperature", 0.7)
         max_tok = max_tokens or self.settings.get("agent.max_tokens", 4096)
@@ -556,14 +526,10 @@ class AgentBrain:
         provider_name, model_id = self.router.resolve_model(model)
 
         try:
-            if provider_name == "anthropic":
-                async for event in self._stream_anthropic(model_id, messages, system_msg, temp, max_tok):
-                    if isinstance(event, dict) and event.get("type") == "text":
-                        yield event["content"]
-                    # tool_calls events are silently dropped in text-only mode
-            else:
-                async for chunk in self._stream_openai(provider_name, model_id, messages, system_msg, temp, max_tok):
-                    yield chunk
+            async for event in self._stream_provider(provider_name, model_id, messages, system_msg, temp, max_tok):
+                if isinstance(event, dict) and event.get("type") == "text":
+                    yield event["content"]
+                # tool_calls events are silently dropped in text-only mode
         except Exception as e:
             logger.error(f"Streaming error with {provider_name}: {e}")
             yield f"\n[Error: {str(e)}]"
@@ -597,22 +563,14 @@ class AgentBrain:
             tool_calls: list[dict] = []
 
             try:
-                if provider_name == "anthropic":
-                    async for event in self._stream_anthropic(
-                        model_id, loop_messages, system_msg, temp, max_tok
-                    ):
-                        if event.get("type") == "text":
-                            accumulated_text += event["content"]
-                            yield event["content"]
-                        elif event.get("type") == "tool_calls":
-                            tool_calls = event["tool_calls"]
-                else:
-                    # Non-Anthropic providers: text-only stream, no tool loop
-                    async for chunk in self._stream_openai(
-                        provider_name, model_id, loop_messages, system_msg, temp, max_tok
-                    ):
-                        yield chunk
-                    return
+                async for event in self._stream_provider(
+                    provider_name, model_id, loop_messages, system_msg, temp, max_tok
+                ):
+                    if event.get("type") == "text":
+                        accumulated_text += event["content"]
+                        yield event["content"]
+                    elif event.get("type") == "tool_calls":
+                        tool_calls = event["tool_calls"]
             except Exception as e:
                 logger.error(f"Stream tool error on round {round_idx}: {e}")
                 yield f"\n[Error: {str(e)}]"
@@ -653,216 +611,6 @@ class AgentBrain:
                 "role": "tool_result",
                 "tool_results": tool_result_entries,
             })
-
-    # ── Provider dispatch (uses ProviderBase when available) ─
-
-    async def _call_provider(
-        self, provider_name: str, model_id: str, messages: list[dict],
-        system_msg: str, temperature: float, max_tokens: int
-    ) -> dict:
-        """Call a specific provider.
-
-        Delegates to a ProviderBase instance when one is registered,
-        otherwise falls back to the legacy direct-client code path
-        (kept for backward compatibility with existing tests).
-        """
-        if provider_name in self._providers:
-            provider = self._providers[provider_name]
-            if provider_name == "anthropic":
-                system, formatted = self._format_messages_anthropic(messages, system_msg)
-                tools = self._get_tool_definitions_anthropic() if self.tool_executor else None
-                return await provider.generate(model_id, formatted, system, tools=tools, temperature=temperature, max_tokens=max_tokens)
-            else:
-                formatted = self._format_messages_openai(messages, system_msg)
-                tools = self._get_tool_definitions_openai() if self.tool_executor and provider.supports_tools else None
-                # OpenAIProvider.generate expects messages WITHOUT a prepended system message
-                # (it prepends one itself). Strip it to avoid duplication.
-                raw_formatted = formatted[1:] if formatted and formatted[0].get("role") == "system" else formatted
-                return await provider.generate(model_id, raw_formatted, system_msg, tools=tools, temperature=temperature, max_tokens=max_tokens)
-
-        # Legacy path — direct SDK clients (used by existing tests that patch _get_anthropic_client)
-        if provider_name == "anthropic":
-            return await self._call_anthropic(model_id, messages, system_msg, temperature, max_tokens)
-        else:
-            return await self._call_openai_compat(provider_name, model_id, messages, system_msg, temperature, max_tokens)
-
-    async def _call_anthropic(
-        self, model_id: str, messages: list[dict], system_msg: str,
-        temperature: float, max_tokens: int
-    ) -> dict:
-        client = self._get_anthropic_client()
-        system, formatted = self._format_messages_anthropic(messages, system_msg)
-
-        # Build request kwargs
-        kwargs = dict(
-            model=model_id,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system,
-            messages=formatted,
-        )
-
-        # Inject native tool definitions if executor is available
-        tools = self._get_tool_definitions_anthropic()
-        if tools and self.tool_executor:
-            kwargs["tools"] = tools
-
-        response = await client.messages.create(**kwargs)
-
-        content = ""
-        tool_calls = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                content += block.text
-            elif block.type == "tool_use":
-                tool_calls.append({
-                    "id": block.id,
-                    "name": block.name,
-                    "arguments": block.input if isinstance(block.input, dict) else {},
-                })
-
-        return {
-            "content": content,
-            "model": model_id,
-            "usage": {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-                "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
-            },
-            "tool_calls": tool_calls,
-        }
-
-    async def _call_openai_compat(
-        self, provider_name: str, model_id: str, messages: list[dict],
-        system_msg: str, temperature: float, max_tokens: int
-    ) -> dict:
-        client = self._get_provider_client(provider_name)
-        formatted = self._format_messages_openai(messages, system_msg)
-
-        kwargs = dict(
-            model=model_id,
-            messages=formatted,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-
-        # Inject native tool definitions (skip for ollama which may not support it)
-        if provider_name not in ("ollama",) and self.tool_executor:
-            tools = self._get_tool_definitions_openai()
-            if tools:
-                kwargs["tools"] = tools
-
-        response = await client.chat.completions.create(**kwargs)
-
-        choice = response.choices[0]
-        usage = response.usage
-
-        # Parse tool calls from OpenAI response
-        tool_calls = []
-        if choice.message.tool_calls:
-            for tc in choice.message.tool_calls:
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except (json.JSONDecodeError, TypeError):
-                        args = {"query": args}
-                tool_calls.append({
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "arguments": args,
-                })
-
-        return {
-            "content": choice.message.content or "",
-            "model": model_id,
-            "usage": {
-                "input_tokens": usage.prompt_tokens if usage else 0,
-                "output_tokens": usage.completion_tokens if usage else 0,
-                "total_tokens": usage.total_tokens if usage else 0,
-            },
-            "tool_calls": tool_calls,
-        }
-
-    async def _stream_anthropic(
-        self, model_id: str, messages: list[dict], system_msg: str,
-        temperature: float, max_tokens: int
-    ) -> AsyncGenerator[dict, None]:
-        """Stream Anthropic response, yielding structured events.
-
-        Yields:
-            ``{"type": "text", "content": str}``  for text deltas
-            ``{"type": "tool_calls", "tool_calls": list[dict]}``  at message_stop when
-            tool_use blocks were accumulated during the stream.
-        """
-        client = self._get_anthropic_client()
-        system, formatted = self._format_messages_anthropic(messages, system_msg)
-
-        kwargs = dict(
-            model=model_id,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system,
-            messages=formatted,
-        )
-
-        # Inject tool definitions so the model can return tool_use blocks
-        tools = self._get_tool_definitions_anthropic()
-        if tools and self.tool_executor:
-            kwargs["tools"] = tools
-
-        tool_calls: list[dict] = []
-        current_tool: dict | None = None
-
-        async with client.messages.stream(**kwargs) as stream:
-            async for event in stream:
-                if event.type == "content_block_start":
-                    if hasattr(event, "content_block") and event.content_block.type == "tool_use":
-                        current_tool = {
-                            "id": event.content_block.id,
-                            "name": event.content_block.name,
-                            "_json": "",
-                        }
-                elif event.type == "content_block_delta":
-                    if hasattr(event, "delta"):
-                        if event.delta.type == "text_delta":
-                            yield {"type": "text", "content": event.delta.text}
-                        elif event.delta.type == "input_json_delta" and current_tool is not None:
-                            current_tool["_json"] += event.delta.partial_json
-                elif event.type == "content_block_stop":
-                    if current_tool is not None:
-                        try:
-                            args = json.loads(current_tool["_json"]) if current_tool["_json"] else {}
-                        except json.JSONDecodeError:
-                            args = {}
-                        tool_calls.append({
-                            "id": current_tool["id"],
-                            "name": current_tool["name"],
-                            "arguments": args,
-                        })
-                        current_tool = None
-                elif event.type == "message_stop":
-                    if tool_calls:
-                        yield {"type": "tool_calls", "tool_calls": tool_calls}
-
-    async def _stream_openai(
-        self, provider_name: str, model_id: str, messages: list[dict],
-        system_msg: str, temperature: float, max_tokens: int
-    ) -> AsyncGenerator[str, None]:
-        client = self._get_provider_client(provider_name)
-        formatted = self._format_messages_openai(messages, system_msg)
-
-        stream = await client.chat.completions.create(
-            model=model_id,
-            messages=formatted,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        )
-
-        async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
 
     # ── Tool execution ──────────────────────────────────────
 
