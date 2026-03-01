@@ -2,6 +2,9 @@
 Gateway API tests - minimal suite covering core routes and security.
 """
 
+import os
+from unittest.mock import MagicMock, patch
+
 import pytest
 from httpx import AsyncClient, ASGITransport
 from openclaw.gateway.server import GatewayServer
@@ -156,3 +159,56 @@ async def test_models_list(app, auth_headers):
         r = await client.get("/api/models", headers=auth_headers)
     assert r.status_code == 200
     assert "models" in r.json()
+
+
+# ── Public bind refusal ─────────────────────────────────────
+
+
+class TestPublicBind:
+    def _make_settings(self, overrides=None):
+        cfg = {}
+        if overrides:
+            cfg = overrides
+        s = MagicMock()
+        s.get = lambda dotpath, default=None: _nested_get(cfg, dotpath, default)
+        return s
+
+    def test_refuses_public_bind_by_default(self):
+        settings = self._make_settings()
+        with patch.dict(os.environ, {}, clear=True):
+            result = GatewayServer._resolve_host("0.0.0.0", settings)
+        assert result == "127.0.0.1"
+
+    def test_allows_public_bind_when_configured(self):
+        settings = self._make_settings({
+            "gateway": {"security": {"allow_public_bind": True}},
+        })
+        result = GatewayServer._resolve_host("0.0.0.0", settings)
+        assert result == "0.0.0.0"
+
+    def test_allows_public_bind_docker_env(self):
+        settings = self._make_settings()
+        env = {
+            "OPENCLAW_GATEWAY__HOST": "0.0.0.0",
+            "OPENCLAW_ALLOW_PUBLIC_BIND": "true",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            result = GatewayServer._resolve_host("0.0.0.0", settings)
+        assert result == "0.0.0.0"
+
+    def test_localhost_unchanged(self):
+        settings = self._make_settings()
+        result = GatewayServer._resolve_host("127.0.0.1", settings)
+        assert result == "127.0.0.1"
+
+
+def _nested_get(cfg: dict, dotpath: str, default=None):
+    """Traverse a nested dict with dot notation."""
+    keys = dotpath.split(".")
+    val = cfg
+    for k in keys:
+        if isinstance(val, dict) and k in val:
+            val = val[k]
+        else:
+            return default
+    return val

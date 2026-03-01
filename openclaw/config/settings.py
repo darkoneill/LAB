@@ -5,8 +5,16 @@ Configuration management with YAML loading, validation, and runtime updates.
 import os
 import yaml
 import copy
+import logging
 from pathlib import Path
 from typing import Any, Optional
+
+from openclaw.security.secrets import decrypt_value, encrypt_value, is_encrypted
+
+logger = logging.getLogger("openclaw.config")
+
+# Keys whose leaf segment matches any of these trigger auto-encryption.
+_SENSITIVE_SEGMENTS = {"api_key", "token", "secret"}
 
 
 class Settings:
@@ -54,7 +62,10 @@ class Settings:
         return instance
 
     def get(self, dotpath: str, default: Any = None) -> Any:
-        """Get a config value using dot notation: 'gateway.port'."""
+        """Get a config value using dot notation: 'gateway.port'.
+
+        Values prefixed with ``ENC:`` are transparently decrypted.
+        """
         keys = dotpath.split(".")
         val = self._config
         for k in keys:
@@ -62,11 +73,36 @@ class Settings:
                 val = val[k]
             else:
                 return default
+        if isinstance(val, str) and is_encrypted(val):
+            try:
+                return decrypt_value(val)
+            except Exception:
+                logger.warning("Failed to decrypt %s — returning raw value", dotpath)
         return val
 
+    @staticmethod
+    def _is_sensitive_key(dotpath: str) -> bool:
+        """Return True if the key name suggests a secret value."""
+        leaf = dotpath.rsplit(".", 1)[-1].lower()
+        return any(seg in leaf for seg in _SENSITIVE_SEGMENTS)
+
     def set(self, dotpath: str, value: Any, persist: bool = False):
-        """Set a config value at runtime. Optionally persist to user.yaml."""
+        """Set a config value at runtime. Optionally persist to user.yaml.
+
+        If the key contains ``api_key``, ``token``, or ``secret`` and the
+        value is a non-empty plain string, it is encrypted automatically.
+        """
         keys = dotpath.split(".")
+
+        # Auto-encrypt sensitive values
+        if (
+            isinstance(value, str)
+            and value
+            and self._is_sensitive_key(dotpath)
+            and not is_encrypted(value)
+        ):
+            value = encrypt_value(value)
+
         cfg = self._config
         for k in keys[:-1]:
             if k not in cfg or not isinstance(cfg[k], dict):

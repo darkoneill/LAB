@@ -7,6 +7,7 @@ Inspired by Kong, LiteLLM, and modern AI gateway best practices.
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -952,11 +953,39 @@ class GatewayServer:
             except Exception as e:
                 logger.error(f"Session cleanup error: {e}")
 
+    @staticmethod
+    def _resolve_host(host: str, settings) -> str:
+        """Refuse ``0.0.0.0`` unless explicitly allowed.
+
+        Allowed when:
+        - ``gateway.security.allow_public_bind`` is truthy in config, **or**
+        - env ``OPENCLAW_GATEWAY__HOST`` is ``0.0.0.0`` **and**
+          ``OPENCLAW_ALLOW_PUBLIC_BIND`` is ``"true"`` (Docker case).
+        """
+        if host != "0.0.0.0":
+            return host
+
+        # Config-level override
+        if settings.get("gateway.security.allow_public_bind", False):
+            return host
+
+        # Docker env-level override
+        env_host = os.environ.get("OPENCLAW_GATEWAY__HOST", "")
+        env_allow = os.environ.get("OPENCLAW_ALLOW_PUBLIC_BIND", "")
+        if env_host == "0.0.0.0" and env_allow.lower() == "true":
+            return host
+
+        logger.warning(
+            "Refused to bind on 0.0.0.0 — set gateway.security.allow_public_bind: true to override"
+        )
+        return "127.0.0.1"
+
     async def start(self, host: str = None, port: int = None):
         """Start the gateway server."""
         import uvicorn
         host = host or self.settings.get("gateway.host", "127.0.0.1")
         port = port or self.settings.get("gateway.port", 18789)
+        host = self._resolve_host(host, self.settings)
         logger.info(f"Starting OpenClaw Gateway on {host}:{port}")
 
         # Start background cleanup task
