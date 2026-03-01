@@ -40,6 +40,9 @@ ml = [
 telegram = [
     "python-telegram-bot>=21.0",
 ]
+discord = [
+    "discord.py>=2.4.0",
+]
 providers = [
     "anthropic>=0.39.0",
     "openai>=1.55.0",
@@ -57,7 +60,7 @@ dev = [
     "ruff>=0.5.0",
 ]
 all = [
-    "openclaw[ml,telegram,providers,docker,monitoring]",
+    "openclaw[ml,telegram,discord,providers,docker,monitoring]",
 ]
 
 [project.scripts]

@@ -117,6 +117,28 @@ async def run_gateway(components, settings):
     await gateway.start()
 
 
+async def _start_discord(components, settings):
+    """Start the Discord channel if enabled.
+
+    Returns ``(channel, task)`` or ``None``.  ``bot.start()`` is blocking,
+    so it runs in a background task.
+    """
+    if not settings.get("channels.discord.enabled", False):
+        return None
+    try:
+        from openclaw.channels.discord import DiscordChannel
+        channel = DiscordChannel(
+            brain=components["agent_brain"],
+            memory_manager=components["memory_manager"],
+        )
+        task = asyncio.create_task(channel.start())
+        logging.getLogger("openclaw.init").info("Discord channel started")
+        return channel, task
+    except Exception as e:
+        logging.getLogger("openclaw.init").error("Discord channel failed to start: %s", e)
+        return None
+
+
 async def _start_telegram(components, settings):
     """Start the Telegram channel if enabled. Returns the channel or None."""
     if not settings.get("channels.telegram.enabled", False):
@@ -151,6 +173,21 @@ async def run_telegram(components, settings):
         await channel.stop()
 
 
+async def run_discord(components, settings):
+    """Run only the Discord bot (blocking)."""
+    result = await _start_discord(components, settings)
+    if not result:
+        print("Discord channel not enabled or failed to start. Check config.")
+        return
+    channel, task = result
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await channel.stop()
+
+
 async def run_both(components, settings):
     """Run both terminal and gateway concurrently."""
     gateway = GatewayServer(
@@ -164,8 +201,10 @@ async def run_both(components, settings):
     cleanup_task = asyncio.create_task(gateway._session_cleanup_loop())
     await gateway.scheduler.start()
 
-    # Start Telegram channel if enabled
+    # Start channels if enabled
     telegram_channel = await _start_telegram(components, settings)
+    discord_result = await _start_discord(components, settings)
+    discord_channel = discord_result[0] if discord_result else None
 
     # Start gateway in background
     import uvicorn
@@ -195,6 +234,8 @@ async def run_both(components, settings):
         server.should_exit = True
         if telegram_channel:
             await telegram_channel.stop()
+        if discord_channel:
+            await discord_channel.stop()
         await gateway.scheduler.stop()
         cleanup_task.cancel()
         gateway_task.cancel()
@@ -234,6 +275,8 @@ async def main_async(args):
         await run_gateway(components, settings)
     elif args.mode == "telegram":
         await run_telegram(components, settings)
+    elif args.mode == "discord":
+        await run_discord(components, settings)
     elif args.mode == "wizard":
         wizard = SetupWizard()
         await wizard.run()
@@ -252,8 +295,8 @@ def main():
         "mode",
         nargs="?",
         default="both",
-        choices=["terminal", "gateway", "telegram", "both", "wizard"],
-        help="Run mode: terminal, gateway, telegram, both (default), wizard",
+        choices=["terminal", "gateway", "telegram", "discord", "both", "wizard"],
+        help="Run mode: terminal, gateway, telegram, discord, both (default), wizard",
     )
     parser.add_argument(
         "--no-wizard",
