@@ -43,8 +43,14 @@ class ProviderBase(ABC):
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
-    ) -> AsyncGenerator[str, None]:
-        """Yield text chunks as they arrive from the provider."""
+    ) -> AsyncGenerator[dict, None]:
+        """Yield structured events as dicts.
+
+        Events::
+
+            {"type": "text", "content": str}            — text delta
+            {"type": "tool_calls", "tool_calls": list}  — accumulated tool_use blocks
+        """
         ...
         # Make this a proper async generator
         yield  # pragma: no cover

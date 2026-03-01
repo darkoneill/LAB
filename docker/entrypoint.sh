@@ -99,6 +99,18 @@ else
     echo -e "${GREEN}[init]${NC} Configuration existante detectee"
 fi
 
+# ── Master key pour le chiffrement des secrets ────────────────
+MASTER_KEY_PATH="${OPENCLAW_MASTER_KEY_PATH:-/root/.openclaw/master.key}"
+if [ -n "${OPENCLAW_MASTER_KEY:-}" ]; then
+    mkdir -p "$(dirname "$MASTER_KEY_PATH")"
+    printf '%s' "$OPENCLAW_MASTER_KEY" > "$MASTER_KEY_PATH"
+    chmod 600 "$MASTER_KEY_PATH"
+    echo -e "${GREEN}[init]${NC} Master key ecrite dans ${MASTER_KEY_PATH}"
+fi
+
+# ── Autoriser le bind public (Docker est derriere nginx) ─────
+export OPENCLAW_ALLOW_PUBLIC_BIND="true"
+
 # ── Lien symbolique config ────────────────────────────────────
 if [ -f "${DATA_DIR}/config/user.yaml" ] && [ ! -f "${APP_DIR}/openclaw/config/user.yaml" ]; then
     ln -sf "${DATA_DIR}/config/user.yaml" "${APP_DIR}/openclaw/config/user.yaml" 2>/dev/null || true

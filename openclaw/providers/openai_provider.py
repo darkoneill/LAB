@@ -100,7 +100,8 @@ class OpenAIProvider(ProviderBase):
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[dict, None]:
+        """Yield structured text events (OpenAI streaming has no tool_use events)."""
         client = self._get_client()
 
         formatted = [{"role": "system", "content": system}] + messages
@@ -115,7 +116,7 @@ class OpenAIProvider(ProviderBase):
 
         async for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+                yield {"type": "text", "content": chunk.choices[0].delta.content}
 
     def _get_client(self):
         if self._client is None:

@@ -316,6 +316,18 @@ Ca prend moins de 2 minutes. C'est parti !
 
         console.print("[success]Options sauvegardees ![/success]")
 
+    @staticmethod
+    def _key_status(key_value: str) -> str:
+        """Return a human-readable status for a provider API key."""
+        from openclaw.security.secrets import is_encrypted
+        if not key_value:
+            return "env/none"
+        if is_encrypted(key_value):
+            return "[green]chiffree[/green]"
+        if len(key_value) > 4:
+            return f"***{key_value[-4:]}"
+        return "***"
+
     def _step_verify(self):
         """Verify configuration."""
         console.print()
@@ -337,8 +349,11 @@ Ca prend moins de 2 minutes. C'est parti !
         for p in ["anthropic", "openai", "ollama", "custom"]:
             if self.settings.get(f"providers.{p}.enabled", False):
                 providers_ok = True
-                key = self.settings.get(f"providers.{p}.api_key", "")
-                key_display = f"***{key[-4:]}" if key and len(key) > 4 else "env/none"
+                # Read raw (encrypted) value to display status
+                raw_key = self.settings._config
+                for seg in f"providers.{p}.api_key".split("."):
+                    raw_key = raw_key.get(seg, "") if isinstance(raw_key, dict) else ""
+                key_display = self._key_status(raw_key if isinstance(raw_key, str) else "")
                 table.add_row(
                     f"Provider {p}",
                     "[green]OK[/green]",
