@@ -100,12 +100,33 @@ providers:
     enabled: false
     base_url: "http://localhost:11434"
     default_model: "llama3.2"
+    tool_capable_models: ["llama3.1", "llama3.2", "llama3.3", "qwen2.5", "mistral-nemo"]
     models: []
   custom:
     enabled: false
     base_url: ""
     api_key: ""
     default_model: ""
+    models: []
+  gemini:
+    enabled: false
+    api_key: ""
+    default_model: "gemini-2.0-flash"
+    models:
+      - id: "gemini-2.0-flash"
+        name: "Gemini 2.0 Flash"
+        max_tokens: 8192
+        context_window: 1048576
+      - id: "gemini-2.5-pro-preview-06-05"
+        name: "Gemini 2.5 Pro"
+        max_tokens: 65536
+        context_window: 1048576
+  openrouter:
+    enabled: false
+    api_key: ""
+    default_model: "anthropic/claude-sonnet-4"
+    http_referer: ""
+    x_title: "OpenClaw"
     models: []
 
 # --- Memory Configuration (MemU-style + RAG) ---
@@ -198,6 +219,12 @@ channels:
     enabled: false
     token: ""
     allowed_users: []  # deny-by-default (ZeroClaw pattern)
+    session_scope: "per_user"
+  discord:
+    enabled: false
+    token: ""
+    allowed_guilds: []  # deny-by-default
+    allowed_users: []   # deny-by-default (both must match)
     session_scope: "per_user"
 
 # --- UI Configuration ---
