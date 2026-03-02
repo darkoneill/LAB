@@ -249,6 +249,64 @@ async def run_both(components, settings):
             pass
 
 
+def run_doctor() -> int:
+    """Run diagnostics and print a Rich-formatted report.
+
+    Returns 0 if healthy, 1 otherwise.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    base_dir = str(Path(__file__).parent)
+    Settings.initialize(base_dir)
+
+    from openclaw.tools.doctor import run_diagnostics
+
+    report = run_diagnostics()
+    console = Console()
+
+    _STATUS_STYLE = {
+        "OK": "[bold green]OK[/bold green]",
+        "WARN": "[bold yellow]WARN[/bold yellow]",
+        "FAIL": "[bold red]FAIL[/bold red]",
+    }
+
+    table = Table(title="OpenClaw Doctor", show_lines=True)
+    table.add_column("Check", style="cyan", min_width=12)
+    table.add_column("Status", justify="center", min_width=6)
+    table.add_column("Message")
+    table.add_column("Details", style="dim")
+
+    for check in report.checks:
+        table.add_row(
+            check.name,
+            _STATUS_STYLE.get(check.status, check.status),
+            check.message,
+            check.details or "",
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
+
+    summary_parts = []
+    if report.ok_count:
+        summary_parts.append(f"[green]{report.ok_count} OK[/green]")
+    if report.warn_count:
+        summary_parts.append(f"[yellow]{report.warn_count} WARN[/yellow]")
+    if report.fail_count:
+        summary_parts.append(f"[red]{report.fail_count} FAIL[/red]")
+
+    console.print("  ".join(summary_parts))
+
+    if report.healthy:
+        console.print("[bold green]System healthy.[/bold green]")
+    else:
+        console.print("[bold red]System unhealthy — fix FAIL items above.[/bold red]")
+
+    return 0 if report.healthy else 1
+
+
 async def main_async(args):
     """Async main entry point."""
     base_dir = str(Path(__file__).parent)
@@ -295,8 +353,8 @@ def main():
         "mode",
         nargs="?",
         default="both",
-        choices=["terminal", "gateway", "telegram", "discord", "both", "wizard"],
-        help="Run mode: terminal, gateway, telegram, discord, both (default), wizard",
+        choices=["terminal", "gateway", "telegram", "discord", "both", "wizard", "doctor"],
+        help="Run mode: terminal, gateway, telegram, discord, both (default), wizard, doctor",
     )
     parser.add_argument(
         "--no-wizard",
@@ -335,6 +393,10 @@ def main():
         os.environ["OPENCLAW_GATEWAY__HOST"] = args.host
     if args.port:
         os.environ["OPENCLAW_GATEWAY__PORT"] = str(args.port)
+
+    # Doctor runs synchronously — no need for the async machinery
+    if args.mode == "doctor":
+        sys.exit(run_doctor())
 
     try:
         asyncio.run(main_async(args))
