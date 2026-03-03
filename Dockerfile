@@ -48,7 +48,7 @@ WORKDIR /app
 
 # Copier le code source
 COPY --chown=openclaw:openclaw openclaw/ ./openclaw/
-COPY --chown=openclaw:openclaw run.py setup.py requirements.txt ./
+COPY --chown=openclaw:openclaw run.py pyproject.toml requirements.txt ./
 COPY --chown=openclaw:openclaw docker/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh
